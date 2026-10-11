@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Odoo Log Summary</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body data-boot="{{ boot }}">
+<header class="topbar">
+    <h1>Odoo Log Summary</h1>
+    <div class="topbar-interval" id="topInterval" hidden>
+        <span class="k">Time interval</span>
+        <input type="text" id="tFrom" placeholder="YYYY-MM-DD HH:MM:SS" spellcheck="false" autocomplete="off">
+        <span class="k">→</span>
+        <input type="text" id="tTo" placeholder="YYYY-MM-DD HH:MM:SS" spellcheck="false" autocomplete="off">
+        <span class="tag" id="ivTag"></span>
+        <button class="btn ghost" id="clearTop" hidden data-tip="Remove the time interval and show the whole selection again.">Clear</button>
+    </div>
+    <span class="tag" id="tzTag" hidden data-tip="Bucket times in the histogram below are shown in this timezone. Everything else (time interval inputs, stats, log lines) stays UTC, matching the log."></span>
+    <div class="topbar-actions">
+        <button class="btn accent" id="clearFacts" hidden></button>
+        <button class="btn ghost" id="exportBtn" hidden
+                data-tip="Downloads the current summary as JSON, safe to hand to someone else or an AI: no database or file names, no raw log lines. Follows whatever files / databases / time interval / excluded operations are selected right now.">Export summary</button>
+        <button class="btn ghost" id="importBtn"
+                data-tip="Load a summary saved earlier with Export summary (a small .json file) instead of re-uploading and re-parsing the original logs. It opens read-only: no database, time-interval or histogram filtering.">Import summary</button>
+        <button class="btn primary" id="addBtn">+ Add logs</button>
+        <button class="btn danger" id="resetBtn"
+                data-tip="<b>Reset everything</b><br>Unloads all files, clears every filter (files, databases, time interval and search boxes) and restores the default view, as if the app had just been started.">Reset</button>
+        <input type="file" id="picker" multiple hidden>
+        <input type="file" id="importPicker" accept=".json,application/json" hidden>
+    </div>
+</header>
+
+<main>
+    <!-- filters: file -> db -> time -->
+    <section class="group" id="filterGroup">
+        <h3 class="group-title">Data selection</h3>
+        <div class="toprow">
+            <div class="card box" id="filesBox">
+                <div class="box-head"><h2>Files</h2></div>
+                <div class="dropzone empty" id="drop" role="button" tabindex="0" aria-label="Add log files">
+                    <span id="dropText">Drop Odoo log files here (plain, .gz, .bz2), or a summary exported earlier (.json), or click to choose them</span>
+                    <div class="progress" id="progress" hidden><div></div></div>
+                </div>
+                <div class="pills" id="chips"></div>
+            </div>
+
+            <div class="card box" id="dbBox">
+                <div class="box-head"><h2>Databases</h2><span class="sub" id="dbSub"></span></div>
+                <div class="onlydb">
+                    <label for="onlyDb" class="sub"
+                           data-tip="<b>Only read one database</b><br>Set it before adding big logs that hold many databases: the lines of every other database (and their tracebacks) are skipped as soon as their header is read, so loading is faster and uses less memory. Lines without a database are always read. Changing it reads the loaded logs again.">Only read database</label>
+                    <input type="text" id="onlyDb" placeholder="every database" spellcheck="false" autocomplete="off">
+                    <button class="btn ghost" id="onlyDbClear" hidden>Read every database</button>
+                    <button class="btn ghost" id="dbScanBtn"
+                            data-tip="Pick a log file (plain or .gz) to list the databases it holds and how many lines each has. The file is read here in the browser, not loaded.">Find databases in a log file…</button>
+                    <input type="file" id="dbScanPicker" multiple hidden>
+                </div>
+                <div class="dbscan" id="dbScan" hidden>
+                    <div class="dbscan-head">
+                        <input type="search" id="dbScanFilter" placeholder="Search databases…" spellcheck="false" autocomplete="off">
+                        <span class="sub" id="dbScanSub"></span>
+                        <button class="btn ghost" id="dbScanClose">Close</button>
+                    </div>
+                    <div class="pills" id="dbScanList"></div>
+                </div>
+                <div class="pills" id="dbs"><span class="sub">Load a log file to see its databases.</span></div>
+            </div>
+        </div>
+    </section>
+
+    <div class="notice" id="notice" hidden></div>
+
+    <section class="group" id="statsGroup" hidden>
+        <h3 class="group-title">General Info</h3>
+        <div class="stats" id="stats"></div>
+    </section>
+
+    <section class="card panel" id="histPanel" hidden>
+        <div class="panel-head">
+            <h2>Requests over time <span class="count" id="histCount"></span></h2>
+            <div class="panel-tools">
+                <button class="btn ghost" id="histFit">Fit all buckets</button>
+                <button class="btn ghost" id="clearHist" hidden data-tip="Remove the time interval and show the whole selection again.">Clear interval</button>
+                <button class="btn ghost" id="histFocusSel" hidden data-tip="Focus on the interval selected inside the focused chart: a narrower span, with finer buckets.">Focus interval</button>
+                <button class="btn ghost" id="histFocus" disabled>Focus interval</button>
+                <div class="menu-wrap">
+                    <button class="select-like" id="histSeriesBtn" data-tip="What the chart plots: <b>total</b> plus one item per search, right-clicked table row or error, each with its own bars and lines (average / total ms, split into Python and SQL, and requests).">Chart items &amp; series ▾</button>
+                    <div class="menu big" id="histSeriesMenu" hidden role="dialog" aria-labelledby="serTitle">
+                        <div class="pop-title"><h3 id="serTitle">Chart items &amp; series</h3><button class="btn ghost" id="serClose">Close</button></div>
+                        <div class="ser-head">
+                            <input type="search" id="histFilter" placeholder="Add an item: type text, press Enter…" spellcheck="false"
+                                   data-tip="Matched against type, app and operation. Right-click a row of the operations table (or of the errors table) to add exactly that one instead.">
+                            <span class="sub">or right-click a row of the operations / errors tables</span>
+                            <span class="grow"></span>
+                            <button class="btn ghost" id="histDefaults" data-tip="Every item back to its default series: bars of requests and a line of the average ms (an error: bars of its occurrences). Total steps aside while other items are shown.">Reset series</button>
+                            <button class="btn ghost" id="histRmAll">Remove all items</button>
+                        </div>
+                        <div class="ser-body" id="histItemsTbl"></div>
+                    </div>
+                </div>
+                <select id="histSize" aria-label="Bucket size"
+                        data-tip="<b>Bucket size</b><br>How much time one bar covers. Finer sizes are limited by how long the log is."></select>
+                <select id="tzSelect" aria-label="Timezone for the histogram"
+                        data-tip="Logs are parsed and stored in UTC, and everything on this page keeps using UTC - except the bar labels and tooltips in this histogram, which switch to this timezone."></select>
+                <button class="btn ghost" data-toggle="hist">Hide</button>
+            </div>
+        </div>
+        <div class="panel-body" id="histBody">
+            <div class="hist-key" id="histKey" aria-label="Chart key"></div>
+            <div class="hist-scroll"><svg id="hist" role="img" aria-label="Requests over time"></svg></div>
+            <div class="sub hist-note">Click a bar to start a time range, then a second bar (or the same one again) to select it; Esc cancels. <b>Focus interval</b> then shows just that range, with finer buckets.</div>
+        </div>
+    </section>
+
+    <section class="card panel" id="tablePanel" hidden>
+        <div class="panel-head">
+            <h2>Top operations <span class="count" id="rowCount"></span></h2>
+            <div class="panel-tools">
+                <select id="tableGroup" aria-label="Group rows by"
+                        data-tip="<b>Operation</b>: every endpoint / model.method / job.<br><b>App</b>: which Odoo app owns the work (sale, stock, account, mail…).<br><b>Type</b>: what kind of work it is (ui.read, ui.action, api.write, report, assets, cron…).">
+                    <option value="operation">By operation</option>
+                    <option value="app">By app</option>
+                    <option value="family">By type</option>
+                </select>
+                <input type="search" id="filter" placeholder="Filter (type, app or operation)…" spellcheck="false">
+                <div class="menu-wrap">
+                    <button class="btn ghost" id="colsBtn" data-tip="Choose which columns the table shows.">Columns ▾</button>
+                    <div class="menu" id="colsMenu" hidden></div>
+                </div>
+                <button class="btn ghost" data-toggle="table">Hide</button>
+            </div>
+        </div>
+        <div class="panel-body" id="tableBody">
+            <div class="table-wrap"><table id="tbl"></table></div>
+        </div>
+    </section>
+
+
+    <section class="card panel" id="issuesPanel" hidden>
+        <div class="panel-head">
+            <h2>Most common errors &amp; warnings <span class="count" id="issueCount"></span></h2>
+            <div class="panel-tools">
+                <select id="issueLevel" aria-label="Level">
+                    <option value="all">Errors &amp; warnings</option>
+                    <option value="errors">Errors only</option>
+                    <option value="warnings">Warnings only</option>
+                </select>
+                <input type="search" id="issueFilter" placeholder="Filter messages…" spellcheck="false">
+                <button class="btn ghost" data-toggle="issues">Hide</button>
+            </div>
+        </div>
+        <div class="panel-body">
+            <div class="table-wrap short"><table id="issuesTbl" class="static"></table></div>
+        </div>
+    </section>
+
+    <section class="card panel" id="selPanel" hidden>
+        <div class="panel-head">
+            <h2>Selected items <span class="count" id="selCount"></span></h2>
+            <div class="panel-tools">
+                <span class="sub">the histogram's items · click one for its details · right-click to deselect</span>
+                <button class="btn ghost" data-toggle="sel">Hide</button>
+            </div>
+        </div>
+        <div class="panel-body" id="selBody">
+            <div class="table-wrap"><table id="selTbl" class="static"></table></div>
+        </div>
+    </section>
+
+</main>
+
+<div id="modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="mTitle">
+        <div class="modal-head">
+            <button class="iconbtn" id="mBack" aria-label="Back">
+                <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7M8 12h13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <h2 id="mTitle">Details</h2>
+            <button class="btn" id="mClose">Close</button>
+        </div>
+        <div class="modal-scroll" id="mScroll">
+            <div class="mfilters" id="mFilters" hidden></div>
+            <div class="msheet" id="mSheet"></div>
+            <nav class="tabs" id="mTabs" role="tablist"></nav>
+            <div class="modal-body" id="mBody"></div>
+        </div>
+    </div>
+</div>
+
+<div id="ffModal" class="popup-back" hidden>
+    <div class="popup" role="dialog" aria-modal="true" aria-labelledby="ffTitle">
+        <div class="pop-title"><h3 id="ffTitle">Item filters</h3><button class="btn ghost" id="ffClose">Close</button></div>
+        <div class="pop-body">
+            <div class="sub">Values picked in an item's <i>Details behind the grouping</i> or <i>Logged during</i> tables. Each keeps only that item's
+                occurrences carrying one of its values (values of one detail: any of them; different details: all of them), everywhere on the page.</div>
+            <div class="table-wrap formtbl"><table class="static" id="ffTbl"></table></div>
+        </div>
+        <div class="pop-foot"><span class="grow"></span><button class="btn danger" id="ffClearAll">Clear all</button></div>
+    </div>
+</div>
+
+<div id="domModal" class="popup-back" hidden>
+    <div class="popup" role="dialog" aria-modal="true" aria-labelledby="domTitle">
+        <div class="pop-title"><h3 id="domTitle">Filter editor</h3><button class="btn ghost" id="domClose">Close</button></div>
+        <div class="pop-body">
+            <div class="sub">The whole global filter as an Odoo-style domain: files, databases, time interval, excluded operations,
+                detail filters, and any condition on requests, jobs and warnings. <code>FILTERS.md</code> documents every field and operator.</div>
+            <textarea id="domText" spellcheck="false" autocomplete="off" aria-label="Filter domain"></textarea>
+            <div class="dom-msg" id="domMsg"></div>
+        </div>
+        <div class="pop-foot">
+            <button class="btn ghost" id="domCopy">Copy</button>
+            <button class="btn ghost" id="domReset" data-tip="Back to the filter that is applied now.">Reset</button>
+            <span class="grow"></span>
+            <button class="btn primary" id="domApply">Apply</button>
+        </div>
+    </div>
+</div>
+
+<div id="busy" role="status" aria-live="polite" hidden><span class="spin"></span><span id="busyText">Working…</span></div>
+<div id="tip" role="tooltip"></div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

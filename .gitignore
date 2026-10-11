@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# virtualenvs
+.venv/
+venv/
+env/
+
+# test and tool caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# editors and local tooling
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.claude/
+
+# logs dropped into the tree while trying the tool (tests/data/ is kept)
+/*.log
+/*.log.gz
+/*.log.bz2
+/*.txt

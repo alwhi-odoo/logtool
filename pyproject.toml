@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logtool"
+dynamic = ["version"]
+description = "Local web UI that shows where an Odoo server's time goes, from its logs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "alwhi" }]
+keywords = ["odoo", "logs", "profiling", "performance", "werkzeug"]
+dependencies = ["flask>=2.3"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Web Environment",
+    "Framework :: Flask",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Logging",
+    "Topic :: System :: Monitoring",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/alwhi-odoo/logtool"
+Documentation = "https://github.com/alwhi-odoo/logtool#readme"
+Issues = "https://github.com/alwhi-odoo/logtool/issues"
+Changelog = "https://github.com/alwhi-odoo/logtool/blob/main/CHANGELOG.md"
+
+[project.scripts]
+logtool = "logtool.app:main"
+logtool-report = "logtool.profiler:main"
+
+[tool.setuptools]
+packages = ["logtool"]
+
+[tool.setuptools.dynamic]
+version = { attr = "logtool.__version__" }
+
+[tool.setuptools.package-data]
+logtool = ["templates/*.html", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
