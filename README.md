@@ -239,13 +239,12 @@ deleted when it stops. Folders left behind by a crash are removed at the next st
 
 The server listens on `127.0.0.1` only. It refuses requests whose `Host` is not a loopback name (DNS rebinding)
 and writes whose `Origin` is another site. `--host 0.0.0.0` exposes the loaded logs to your network and prints a
-warning. See [SECURITY.md](SECURITY.md) to report a vulnerability.
+warning.
 
 ## Documentation
 
 * [FILTERS.md](FILTERS.md): the filter-domain language, for people and for agents writing domains.
-* [docs/SRS.md](docs/SRS.md): the software requirements specification (what logtool must do, and why).
-* [CONTRIBUTING.md](CONTRIBUTING.md): development setup, tests and how the code is organized.
+* [SRS.md](SRS.md): the software requirements specification (what logtool must do, and why).
 * [CHANGELOG.md](CHANGELOG.md): what changed in each version.
 
 ## Tests
