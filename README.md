@@ -1,3 +1,6 @@
+# AI Disclaimer: 
+The project was fully implemented by Claude Code. All documentation beyond this paragraph is AI generated. 
+
 # logtool
 
 [![tests](https://github.com/alwhi-odoo/logtool/actions/workflows/tests.yml/badge.svg)](https://github.com/alwhi-odoo/logtool/actions/workflows/tests.yml)
