@@ -1527,8 +1527,12 @@ def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=
         iv = tuple(a["interval"]) if a["interval"] else None
         prof = _heavy(_prof_for(inc, ids, excl, iv, flt))
         prof0 = _heavy(_prof_for(inc, ids, excl, iv)) if flt[0] else prof
-        nodb = (_prof_for(inc, ids, frozenset(d for d, _ in dbs if d != NONE_DB), iv, flt)
-                if NONE_DB in {d for d, _ in dbs} - excl else None)
+        nodb = None                                     # what lines without a database logged (to censor)
+        if NONE_DB in {d for d, _ in dbs} - excl:
+            try:
+                nodb = _prof_for(inc, ids, frozenset(d for d, _ in dbs if d != NONE_DB), iv, flt)
+            except NoData:                              # none of them in the interval
+                pass
     keep = [d for d in dbs if d[0] not in excl]
     secrets = [s for s in _secret_names({d for d, _ in dbs if d in excl and d not in ("?", "None")}, files)
                if s not in {d for d, _ in keep}]
@@ -1578,7 +1582,17 @@ def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=
             details["\x1f".join(("issue",) + issue_key(key))] = {
                 "found": True, "facts": facts(f) if key in tainted["issue"] else f}
 
+    # an interval or a focus: the histogram shows just that span, at its finer buckets (see timeline())
     view = dict(view or {})
+    span = iv or (tuple(view["focus"]) if isinstance(view.get("focus"), list) and len(view["focus"]) == 2 else None)
+    focus = None
+    if span:
+        keys = [tuple(it["issue"]) for it in view.get("items", []) if isinstance(it.get("issue"), list) and len(it["issue"]) == 3]
+        t = timeline(set(excl), exclude_file, span, flt, keys, frozenset((pins or {}).get("ops", [])))
+        focus = dict(t, ops=[op(o) for o in t["ops"]],
+                     issues=[dict(i, **dict(zip(("level", "logger", "message"), issue_key((i["level"], i["logger"], i["message"])))))
+                             for i in t["issues"]])
+    view["focus"] = [focus["from"], focus["to"]] if focus else None
     for it in view.get("items", []):
         if isinstance(it.get("issue"), list) and len(it["issue"]) == 3:
             it["issue"] = list(issue_key(it["issue"]))
@@ -1590,6 +1604,7 @@ def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=
         "filter": desc,
         "view": view,
         "details": details,
+        "focus": focus,
         "analyze": dict(a, files=[], databases=keep, excluded_db=[], hist_key="snapshot",
                         view=dict(v, files=[None] * len(v["files"]), rows_key="snapshot",
                                   rows=[dict(r, operation=scrub("operation", r["operation"])) for r in v["rows"]],

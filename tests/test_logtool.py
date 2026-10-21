@@ -423,6 +423,13 @@ def test_export_html_shows_only_the_selected_database_and_censors_lines_without_
     assert "/web/image/res.partner/7/avatar_128" in facts(img["facts"])["URL"] and img["examples"], img
     sel = next(d for k, d in snap["details"].items() if "selector" in k)        # a line without a database: censored
     assert [ip[:3] for ip in facts(sel["facts"])["client IP"]] == ["ip-"] and not sel["examples"], sel
+    assert snap["focus"] is None and snap["view"]["focus"] is None, snap["focus"]
+    w = a["window"]                                                            # an interval: the histogram shows just it
+    r = c.get("/api/export_html?exclude_db=othercustomer&from=%d&to=%d&view=%s" % (w[0] + 60, w[0] + 180, quote(json.dumps({"items": []}))))
+    snap = json.loads(re.search(r'id="snapshot">(.*?)</script>', r.get_data(as_text=True), re.S).group(1))
+    f = snap["focus"]
+    assert snap["view"]["focus"] == [f["from"], f["to"]] == [w[0] + 60, w[0] + 180] and f["base"] == 1, f
+    assert all(f["from"] // 60 <= m < -(-f["to"] // 60) for m, *_ in f["all"]), f["all"]      # (its last minute: whole)
     assert c.get("/api/export_html?view=" + quote("[]")).status_code == 400
 
 

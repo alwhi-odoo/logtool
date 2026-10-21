@@ -188,6 +188,7 @@ function snapApi(url) {
     const u = new URL(url, location.href), q = u.searchParams;
     const key = u.pathname === "/api/issue_detail" ? ["issue", q.get("level"), q.get("logger"), q.get("msg")] : [q.get("by"), q.get("name")];
     if (u.pathname === "/api/analyze") return structuredClone(SNAP.analyze);
+    if (u.pathname === "/api/timeline" && SNAP.focus) return structuredClone(SNAP.focus);
     if (["/api/detail", "/api/issue_detail"].includes(u.pathname) && SNAP.details[key.join("\x1f")]) return SNAP.details[key.join("\x1f")];
     throw new Error("this HTML export only carries the details of the top rows of each table");
 }
@@ -256,11 +257,11 @@ async function exportAs(src, fallback) {
     }
 }
 
-// Export HTML: the selection plus what the page shows on top of it, but not the focus (it needs the server)
+// Export HTML: the selection plus what the page shows on top of it (the server adds the focused timeline)
 function exportHtml() {
     const p = selectionParams();
     if (pinsParam()) p.set("pins", pinsParam());
-    p.set("view", JSON.stringify(Object.assign(viewState(), {focus: null})));
+    p.set("view", JSON.stringify(viewState()));
     p.set("desc", filterParts(false).join(" · "));
     return exportAs("/api/export_html?" + p, "logtool-export.html");
 }
