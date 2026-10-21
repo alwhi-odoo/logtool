@@ -20,6 +20,7 @@ chunks that lie inside it and re-reads just the two edges of the interval.
 from __future__ import annotations
 
 import argparse
+import bisect
 import bz2
 import datetime
 import errno
@@ -1133,6 +1134,30 @@ def _facts_view(prof, prof0, by, name, flt, logged=False):
     return out
 
 
+# edges of the call-duration histogram in an item's details, in ms: 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1, 1.5, ...
+# (even steps on a log scale, so 2 ms and 20 s calls both get readable bars)
+DUR_EDGES = [round(m * 10 ** e, 4) for e in range(-1, 7) for m in (1, 1.5, 2, 3, 5, 7)]
+
+
+def _durations(bs):
+    """How long the calls of one or more operations took, from their percentile samples (see olp.Bucket.sample),
+    each value standing for seen / len(sample) calls: {"bins": [[from ms, to ms, calls], ...] (the empty bins
+    before the first and after the last call left out; None: no bound), "estimated": a sample did not keep
+    every call}."""
+    counts = [0.0] * (len(DUR_EDGES) + 1)
+    for b in bs:
+        if b.sample:
+            w, smp = b.seen / len(b.sample), sorted(b.sample)
+            at = [0] + [bisect.bisect_left(smp, e / 1000) for e in DUR_EDGES] + [len(smp)]
+            for i in range(len(counts)):
+                counts[i] += w * (at[i + 1] - at[i])
+    bins = [[DUR_EDGES[i - 1] if i else 0, DUR_EDGES[i] if i < len(DUR_EDGES) else None, round(n)]
+            for i, n in enumerate(counts)]
+    used = [i for i, b in enumerate(bins) if b[2]]
+    return {"bins": bins[used[0]:used[-1] + 1] if used else [],
+            "estimated": any(b.seen > len(b.sample) for b in bs)}
+
+
 def _detail(prof, by, name, facts, logged=()):
     """What the popup of one operation / app / type shows: example log lines and the untimed lines matched to it.
     logged: the details of the lines logged while it ran (users, records), like facts but from those lines."""
@@ -1144,6 +1169,7 @@ def _detail(prof, by, name, facts, logged=()):
         first, last, active = _span(b)
         return {"found": True, "by": by, "name": name, "examples": _examples(name, b),
                 "top_ops": [], "sources": _sources(prof, [name], b.n), "facts": facts, "logged_facts": logged,
+                "durations": _durations([b]),
                 "calls": b.n, "first": first, "last": last, "active_minutes": active}
     first, last, active = _span(*(prof.det[op] for op in ops))
     calls = sum(prof.det[op].n for op in ops)
@@ -1155,6 +1181,7 @@ def _detail(prof, by, name, facts, logged=()):
                         for op in ops],
             "ops_n": len(ops),
             "sources": _sources(prof, ops, calls),
+            "durations": _durations([prof.det[op] for op in ops]),
             "facts": facts, "logged_facts": logged, "calls": calls,
             "first": first, "last": last, "active_minutes": active}
 

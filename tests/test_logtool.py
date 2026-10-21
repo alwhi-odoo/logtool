@@ -341,6 +341,17 @@ def test_facts_keep_what_grouping_collapses(c):
 
 
 @case
+def test_details_count_calls_per_duration(c):
+    upload(c, "f.log", IMG % (b"7", b"0.001") + IMG % (b"8", b"0.3") + IMG % (b"9", b"0.31") + CRON)
+    analyze(c)
+    d = detail(c, "operation", "image res.partner.avatar_128")[1]["durations"]
+    assert [b[2] for b in d["bins"]] == [1] + [0] * (len(d["bins"]) - 2) + [2] and not d["estimated"], d
+    assert d["bins"][0][0] <= 11 < d["bins"][0][1] and d["bins"][-1][0] <= 311 < d["bins"][-1][1], d
+    d = detail(c, "family", "cron")[1]["durations"]
+    assert sum(b[2] for b in d["bins"]) == 1 and d["bins"][0][0] <= 250 < d["bins"][0][1], d
+
+
+@case
 def test_op_lines_lists_an_operations_own_lines(c):
     upload(c, "f.log", IMG % (b"7", b"0.1") + IMG % (b"8", b"0.3") + IMG % (b"9", b"0.2") + CRON)
     analyze(c)

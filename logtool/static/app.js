@@ -2222,6 +2222,41 @@ function sourcesSection(d, grouped) {
 
 const detailSig = d => d && d.calls ? {base: d.calls, unit: "calls", span: spanSecs(d.first, d.last)} : null;
 
+// how long the calls took: one bar per duration bin (ms, even steps on a log scale; see DUR_EDGES in app.py), with
+// the row's average and p95 marked. r: the row (null when the filters left none of it)
+const fMs = ms => ms >= 1000 ? `${+(ms / 1000).toFixed(2)} s` : ms >= 10 ? `${nf0.format(ms)} ms` : `${+ms.toFixed(2)} ms`;
+function durationsSection(d, r) {
+    const bins = (d.durations && d.durations.bins) || [];
+    if (!bins.length) return `<div class="sub">No timed calls.</div>`;
+    const W = 900, H = 280, L = 52, R = 12, T = 18, B = 40, w = (W - L - R) / bins.length;
+    const total = bins.reduce((n, b) => n + b[2], 0), top = Math.max(...bins.map(b => b[2]));
+    const y = n => T + (H - T - B) * (1 - n / top), every = Math.ceil(56 / w);
+    const x = ms => {                                     // where a duration falls: its bin, then log-interpolated inside it
+        const i = bins.findIndex(b => b[1] === null || ms < b[1]);
+        if (i < 0) return W - R;
+        const [lo, hi] = bins[i], f = lo > 0 && hi ? Math.log(ms / lo) / Math.log(hi / lo) : .5;
+        return L + (i + Math.min(1, Math.max(0, f))) * w;
+    };
+    let svg = [0, .5, 1].map(f => `<line x1="${L}" x2="${W - R}" y1="${y(top * f)}" y2="${y(top * f)}" class="grid"/>` +
+        `<text x="${L - 6}" y="${y(top * f) + 4}" text-anchor="end" class="dim">${nf0.format(top * f)}</text>`).join("");
+    svg += bins.map(([lo, hi, n], i) => {
+        const tip = `<b>${hi === null ? `≥ ${fMs(lo)}` : `${fMs(lo)} – ${fMs(hi)}`}</b><br>${nf0.format(n)} calls · ${fPct(total ? 100 * n / total : 0)}`;
+        return `<g data-tip="${esc(tip)}"><rect class="dcol" x="${L + i * w}" y="${T}" width="${w}" height="${H - T - B}"/>` +
+            (n ? `<rect x="${L + i * w + 1}" y="${y(n)}" width="${Math.max(1, w - 2)}" height="${H - B - y(n)}" fill="${TONE.calls}" rx="1.5"/>` : "") + `</g>` +
+            (i % every ? "" : `<text x="${L + i * w}" y="${H - B + 16}" text-anchor="middle" class="dim">${fMs(lo)}</text>`);
+    }).join("");
+    if (r) svg += [["avg", r.avg_ms, TONE.avg_ms], ["p95", 1000 * r.p95_s, "#ef8a5a"]].map(([k, ms, c], i) => {
+        const at = x(ms), left = at > W - 140;           // near the right edge: the label goes on the line's left
+        return `<line x1="${at}" x2="${at}" y1="${T - 4}" y2="${H - B}" stroke="${c}" stroke-width="1.5" stroke-dasharray="4 3"/>` +
+            `<text x="${left ? at - 4 : at + 4}" y="${T + 6 + 16 * i}" text-anchor="${left ? "end" : "start"}" style="fill:${c}">${k} ${fMs(ms)}</text>`;
+    }).join("");
+    svg += `<text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle" class="dim">time per call (log scale)</text>`;
+    return `<div class="sub srcnote">How many calls took how long, ${nf0.format(total)} in all: each bar is one span of durations, ` +
+        `the spans growing evenly on a log scale so fast and slow calls both show.` +
+        (d.durations.estimated ? ` Counts are estimated from a sample of the calls.` : "") + `</div>` +
+        `<svg class="durhist" viewBox="0 0 ${W} ${H}" role="img" aria-label="Call durations">${svg}</svg>`;
+}
+
 // first / last seen, once the details have loaded: more widgets in the sheet
 const spanFacts = d => !d.first ? "" : [["First seen", fStamp(d.first)], ["Last seen", fStamp(d.last)],
     ["Active in", `${nf0.format(d.active_minutes)} distinct minutes`]].map(([k, val]) =>
@@ -2247,6 +2282,7 @@ function openDetail(by, name) {
     const tabs = [
         {id: "details", label: "Details behind the grouping", html: `<div id="factsSection">${loading}</div>`},
     ];
+    tabs.push({id: "durations", label: "Histogram", html: `<div class="pane-card" id="durSection">${loading}</div>`});
     if (grouped) tabs.push({id: "ops", label: "Operations", html: `<div class="pane-card" id="opsSection">${loading}</div>`});
     tabs.push({id: "sources", label: "Logged during", html: `<div class="pane-card" id="srcSection">${loading}</div><div id="loggedFacts">${loading}</div>`});
     if (!state.data.imported && !SNAP) tabs.push({id: "raw", label: "Raw log lines", html: rawSection()});
@@ -2259,6 +2295,7 @@ function openDetail(by, name) {
         $("#factsSection").innerHTML = factsSection(r && r.facts, what, null, null, null, r && {base: r.calls, unit: "calls", span: null});
         $("#loggedFacts").innerHTML = "";
         for (const id of ["#opsSection", "#srcSection"]) if ($(id)) $(id).innerHTML = `<div class="sub">An imported summary keeps no log lines.</div>`;
+        $("#durSection").innerHTML = `<div class="sub">An imported summary keeps no call durations.</div>`;
         return true;
     }
     const p = selectionParams();
@@ -2272,12 +2309,13 @@ function openDetail(by, name) {
             factsSection(d.logged_facts, what, owner, loggedNote, loggedEmpty, sig) + `</div>`;
         if (!d.found) {
             const msg = `<div class="sub">${ffFind(by, name) ? gone : `This ${GROUP_LABEL[by]} is not in the current selection any more.`}</div>`;
-            for (const id of ["#opsSection", "#srcSection", "#rawOcc"]) if ($(id)) $(id).innerHTML = msg;
+            for (const id of ["#opsSection", "#srcSection", "#durSection", "#rawOcc"]) if ($(id)) $(id).innerHTML = msg;
             return;
         }
         lastDetail = {by, name, r, d};
         const facts = $("#mSheet .facts");
         if (facts) facts.insertAdjacentHTML("beforeend", spanFacts(d));
+        $("#durSection").innerHTML = durationsSection(d, r);
         if (grouped) { $("#opsSection").innerHTML = opsSection(d); setTabLabel("ops", `Operations (${nf0.format(d.top_ops.length)})`); }
         $("#srcSection").innerHTML = sourcesSection(d, grouped);
         if (d.sources.total) setTabLabel("sources", `Logged during (${nf0.format(d.sources.total)})`);
@@ -2285,7 +2323,7 @@ function openDetail(by, name) {
     }).catch(e => {                                                          // say so in every pane still waiting
         if (seq !== detailSeq) return;
         const msg = `<div class="sub err">Could not load the details: ${esc(e.message)}</div>`;
-        for (const id of ["#factsSection", "#loggedFacts", "#opsSection", "#srcSection", "#rawOcc"]) {
+        for (const id of ["#factsSection", "#loggedFacts", "#durSection", "#opsSection", "#srcSection", "#rawOcc"]) {
             const el = $(id);
             if (el && el.querySelector(".loading")) el.innerHTML = msg;
         }

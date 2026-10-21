@@ -220,6 +220,12 @@ html.nothing-loaded .group-title { background: #101112; }
 #hist .bar { pointer-events: none; }
 #hist .avgline { fill: none; stroke-width: 2; pointer-events: none; }
 .hist-note { padding: 2px 4px 0; text-align: center; }
+.durhist { display: block; width: 100%; height: auto; margin-top: 8px; }
+.durhist text { fill: var(--text); font-size: 12px; font-family: inherit; }
+.durhist text.dim { fill: var(--dim); }
+.durhist .grid { stroke: var(--line); }
+.durhist .dcol { fill: transparent; }
+.durhist g:hover .dcol { fill: rgba(255, 255, 255, .06); }
 #hist text.unit { font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
 .hist-key { display: flex; flex-wrap: wrap; gap: 4px 18px; padding: 2px 6px 8px; font-size: 12.5px; min-height: 22px; }
 .key-item { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; }

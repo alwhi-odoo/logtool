@@ -11,6 +11,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
   selected databases are in it (the others are not named), as they are; what lines without a database logged is
   censored (IPs, sessions, logins, emails, user and record ids pseudonymized); the details popup is kept for the top
   50 rows of each table.
+- **Histogram** tab in the details of an operation, app or type: how many calls took how long (ms, log scale), with
+  the average and p95 marked.
 
 ## [1.2.0] - 2026-10-11
 

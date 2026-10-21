@@ -139,6 +139,11 @@ them, session ids (from Odoo 19.4), raw URLs, cron ids and run status. For a war
 behind each `#`, the user ids and records named in the message or its traceback, and the client of the request it
 was logged during.
 
+*Histogram* (operations, apps and types) shows how long their calls took: the number of calls per span of
+milliseconds, the spans growing evenly on a log scale (…, 10, 15, 20, 30, 50, 70, 100 ms, …) so quick and slow calls
+both show, with the average and p95 marked. It follows the selection, time interval and filters like the rest of the
+form. Past 20,000 calls of one operation the counts are estimated from a sample of them.
+
 *Raw log lines* lists the operation's own lines (in log order or slowest first) or the message's occurrences.
 Click one to see the lines around it in the file, color coded: the occurrence itself, other occurrences of the
 same item, its parent (the request it was logged during) and what was logged during it.
