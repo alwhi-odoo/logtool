@@ -335,6 +335,10 @@ versions. Requirements on it:
   email addresses, and IPv4 / IPv6 addresses. User and record ids shall be kept.
 * **FR-EXP-3** Importing an exported summary shall show it read-only (no file, database or interval selection).
   A file that is not a valid export shall be marked as such.
+* **FR-EXP-4** *Export HTML* shall download the page as one standalone HTML file (no request to any server) showing
+  the current selection read-only, with the page's view settings. It shall name no database other than the
+  selected ones, contain no file names and no raw log lines, scrub free text as in FR-EXP-2 and also replace user
+  and record ids by stable pseudonyms. It shall carry the details of the top 50 rows of each table.
 
 ### 3.3 Non-functional requirements
 
@@ -493,3 +497,4 @@ Access lines:
 | `GET /api/issue_context` | lines around one occurrence |
 | `GET /api/domain`, `POST /api/domain` | the page state as a domain; check and apply a domain (`{"domain": "..."}`) |
 | `GET /api/export` | the export summary (attachment) |
+| `GET /api/export_html` | the standalone HTML page of the selection (attachment; `view`, `pins`, `desc`) |

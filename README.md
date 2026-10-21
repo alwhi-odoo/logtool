@@ -168,6 +168,19 @@ automation rule, per-client activity over time, the logins, the lines per log le
 particular log cannot show (no DEBUG lines, no session per request, ...). `fields` explains each key.
 *Import summary* opens one again, read-only.
 
+## Export HTML
+
+*Export HTML* downloads the page itself as one standalone `.html` file that opens in any browser, offline. It shows
+the current selection as it is on screen (time interval, filters, chart items, table and error settings) and only
+the selected databases: the others are not even named. The selected database names stay; file names and raw log
+lines are left out. Free text is scrubbed like *Export summary*'s (the other databases' and the files' names, IPs,
+emails), and client IPs, sessions, logins, user ids and record ids become stable pseudonyms (`ip-3`, `uid-1`,
+`sale.order(id-4)`).
+
+It opens read-only: sorting, filtering and grouping the tables, chart items, bucket size and timezone still work;
+picking another database or time interval, focus, item filters, the filter editor and raw log lines do not. The
+details popup is kept for the top 50 rows of each table (operations, apps, types, errors).
+
 ## Performance
 
 Measured on a 200 MB, 34-day log (about 1.1 million requests) on 12 cores:

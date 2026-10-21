@@ -182,7 +182,18 @@ function busy(key, text) {
 /* ---------------------------------------------------------------------- *
  * API
  * ---------------------------------------------------------------------- */
+// An Export HTML page (see export_html in app.py) has no server: what it built in answers instead
+const SNAP = (el => el && JSON.parse(el.textContent))($("#snapshot"));
+function snapApi(url) {
+    const u = new URL(url, location.href), q = u.searchParams;
+    const key = u.pathname === "/api/issue_detail" ? ["issue", q.get("level"), q.get("logger"), q.get("msg")] : [q.get("by"), q.get("name")];
+    if (u.pathname === "/api/analyze") return structuredClone(SNAP.analyze);
+    if (["/api/detail", "/api/issue_detail"].includes(u.pathname) && SNAP.details[key.join("\x1f")]) return SNAP.details[key.join("\x1f")];
+    throw new Error("this HTML export only carries the details of the top rows of each table");
+}
+
 async function api(url, opts) {
+    if (SNAP) return snapApi(url);
     const r = await fetch(url, opts);
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || r.statusText);
@@ -223,14 +234,14 @@ function selectionParams() {                      // the file -> database -> tim
     return p;
 }
 
-// Downloads the current selection's summary, scrubbed of database / file names and raw log lines
-// (see app.py's EXPORT_NOTE), by simply navigating to the attachment: the browser does the download.
-async function exportSummary() {
+// Downloads an export of the current selection: the summary, scrubbed of database / file names and raw log
+// lines (see app.py's EXPORT_NOTE), or the page itself as a standalone file (see export_html in app.py)
+async function exportAs(src, fallback) {
     busy("export", "Exporting…");
     try {
-        const r = await fetch("/api/export?" + selectionParams());
+        const r = await fetch(src);
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
-        const name = (/filename="([^"]+)"/.exec(r.headers.get("Content-Disposition") || "") || [])[1] || "logtool-export.json";
+        const name = (/filename="([^"]+)"/.exec(r.headers.get("Content-Disposition") || "") || [])[1] || fallback;
         const url = URL.createObjectURL(await r.blob()), a = document.createElement("a");
         a.href = url;
         a.download = name;
@@ -243,6 +254,15 @@ async function exportSummary() {
     } finally {
         busy("export");
     }
+}
+
+// Export HTML: the selection plus what the page shows on top of it, but not the focus (it needs the server)
+function exportHtml() {
+    const p = selectionParams();
+    if (pinsParam()) p.set("pins", pinsParam());
+    p.set("view", JSON.stringify(Object.assign(viewState(), {focus: null})));
+    p.set("desc", filterParts(false).join(" · "));
+    return exportAs("/api/export_html?" + p, "logtool-export.html");
 }
 
 // what is pinned (chart items, selected errors): the server sends those even outside its top-N lists
@@ -280,7 +300,8 @@ async function analyzeNow() {
         const note = carryNotice || fileProblems() ||
             (j.imported ? `Imported summary — read-only, no database or time-interval filtering${j.hist_key ? "" : " or histogram"}.` : "");
         carryNotice = "";
-        setNotice(note, !!note);
+        if (SNAP && !note) setNotice(SNAP.note);
+        else setNotice(note, !!note);
     } catch (e) {
         if (seq !== analyzeSeq) return false;
         if (state.interval && /interval/.test(e.message)) {      // it no longer fits the data: fall back to the whole selection
@@ -308,7 +329,7 @@ async function analyzeNow() {
 
 function upload(fileList) {
     const files = [...fileList];
-    if (!files.length) return;
+    if (!files.length || SNAP) return;
     const fd = new FormData();
     files.forEach(f => fd.append("files", f));
     const xhr = new XMLHttpRequest();
@@ -401,7 +422,7 @@ function toggleFile(id) {
 }
 
 function toggleDb(name) {
-    if (!state.data) return;
+    if (!state.data || SNAP) return;
     const names = state.data.databases.map(d => d[0]);
     if (state.excluded.has(name)) state.excluded.delete(name);
     else if (names.filter(n => !state.excluded.has(n)).length > 1) state.excluded.add(name);   // keep one
@@ -493,7 +514,7 @@ function setNotice(msg, err) {
 }
 
 const resetDropText = () => {
-    const none = !state.files.length;
+    const none = !state.files.length && !SNAP;
     $("#dropText").textContent = none
         ? "Drop Odoo log files here (plain, .gz, .bz2), or a summary exported earlier (.json), or click to choose them"
         : "Drop more logs here, or click to choose them";
@@ -523,7 +544,7 @@ function renderDbs() {
     box.innerHTML = dbs.map(([n, c]) => {
         const off = state.excluded.has(n);
         return `<span class="pill${off ? " off" : ""}"><button class="pname" data-db="${esc(n)}" ` +
-            `title="${esc(n === "-" ? "Log lines that carry no database name" : n)} · ${nf0.format(c)} log lines - click to ${off ? "include" : "exclude"}">${esc(dbLabel(n))}</button>` +
+            `title="${esc(n === "-" ? "Log lines that carry no database name" : n)} · ${nf0.format(c)} log lines${SNAP ? "" : ` - click to ${off ? "include" : "exclude"}`}">${esc(dbLabel(n))}</button>` +
             `<span class="pn">${fCompact(c)}</span></span>`;
     }).join("");
     $("#dbSub").textContent = `${dbs.filter(d => !state.excluded.has(d[0])).length} of ${dbs.length} selected` +
@@ -691,7 +712,7 @@ function renderAll() {
     const has = !!state.data;
     for (const id of ["statsGroup", "tablePanel", "issuesPanel"]) $("#" + id).hidden = !has;
     $("#histPanel").hidden = !has || !state.data.hist_key;                       // no per-minute data in an older import
-    $("#exportBtn").hidden = !has || state.data.imported;                        // re-exporting an import would just hand back what it already is
+    $("#exportBtn").hidden = $("#exportHtmlBtn").hidden = !has || state.data.imported;   // re-exporting an import would just hand back what it already is
     $("#selPanel").hidden = !has || !pickedCount();
     hideTip();                                                                     // its element is about to be replaced
     if (!has) return;
@@ -765,10 +786,10 @@ function renderStats() {
 /* ---- filter editor: the whole global filter as an Odoo-style domain (see FILTERS.md) ---------------- */
 const plural = (n, one, many) => `${nf0.format(n)} ${n === 1 ? one : many || one + "s"}`;
 const domTerms = d => (d || []).filter(x => Array.isArray(x)).length;
-function filterParts() {
+function filterParts(sources = true) {          // sources: also the files and databases left out
     const parts = [], nf = state.factFilters.reduce((n, f) => n + Object.values(f.facts).reduce((m, v) => m + v.length, 0), 0);
-    if (state.excludedFiles.size) parts.push(plural(state.excludedFiles.size, "file") + " left out");
-    if (state.excluded.size) parts.push(plural(state.excluded.size, "database") + " left out");
+    if (sources && state.excludedFiles.size) parts.push(plural(state.excludedFiles.size, "file") + " left out");
+    if (sources && state.excluded.size) parts.push(plural(state.excluded.size, "database") + " left out");
     if (state.interval) parts.push("time interval");
     if (nf) parts.push(plural(nf, "item filter"));
     if (state.extraDomain) parts.push(plural(domTerms(state.extraDomain), "custom condition"));
@@ -777,6 +798,7 @@ function filterParts() {
 const viewParts = () => [pickedCount() && plural(pickedCount(), "chart item"), state.focus && "focused"].filter(Boolean);
 
 function filterCard() {
+    if (SNAP) return `<div class="stat filtercard"><span class="k">Filter</span><span class="s">${esc(SNAP.filter || "the whole selection")}</span></div>`;
     const parts = filterParts(), off = state.data.imported;
     return `<div class="stat filtercard" data-tip="${esc("The whole global filter as an Odoo-style domain, to read, copy, paste or write by hand (FILTERS.md explains the language).")}">` +
         `<span class="k">Filter editor</span>` +
@@ -1375,7 +1397,7 @@ hist.addEventListener("mousemove", e => {
         const label = x.item.label.length > 40 ? x.item.label.slice(0, 39) + "…" : x.item.label;
         h += `<br>${seriesIcon(x)} ${esc(label)} <span style="color:var(--dim)">(${esc(seriesName(x.item, x.s))})</span>: <b>${fSeriesVal(x.s, x.vals[gi])}</b>`;
     }
-    h += `<br><span style="color:var(--dim)">${state.anchor ? "click to select the range up to this bar (this bar alone if it is the same one) · Esc to cancel" : "click to start a range here · a second click selects it"}</span>`;
+    if (!SNAP) h += `<br><span style="color:var(--dim)">${state.anchor ? "click to select the range up to this bar (this bar alone if it is the same one) · Esc to cancel" : "click to start a range here · a second click selects it"}</span>`;
     showTip(h, e.clientX, e.clientY);
 });
 hist.addEventListener("mouseleave", () => {
@@ -1386,7 +1408,7 @@ hist.addEventListener("mouseleave", () => {
 });
 hist.addEventListener("click", e => {
     const el = e.target.closest("[data-g]"), info = hist._info;
-    if (!el || !info || !state.data.window) return;      // an imported summary has no raw data left to re-slice
+    if (!el || !info || !state.data.window || SNAP) return;      // an imported summary / Export HTML has no raw data left to re-slice
     const m = info.keys[+el.dataset.g];
     const bar = {from: m * 60, to: (m + info.size) * 60};
     const a = state.anchor;
@@ -2022,7 +2044,7 @@ function factTable(f, owner) {
     const shown = Math.min(factShown[f.detail] || FACT_CHUNK, f.values.length);
     const filt = owner && ffFind(owner.by, owner.name);
     const picked = new Set((filt && filt.facts[f.detail]) || []);
-    const can = !!owner && !state.data.imported && !(owner.by === "issue" && ISSUE_UNFILTERABLE.includes(f.detail));
+    const can = !!owner && !state.data.imported && !SNAP && !(owner.by === "issue" && ISSUE_UNFILTERABLE.includes(f.detail));
     const logins = f.values.some(v => v[2]), sig = !!(f.sig && f.sig.base), avg = !!f.avg_ms;
     const rows = f.values.slice(0, shown).map(([v, n, who], i) => {
         const ok = can && v !== FACT_OTHER;
@@ -2034,7 +2056,7 @@ function factTable(f, owner) {
     }).join("");
     const notes = (f.distinct > f.values.length ? `<div class="sub">…and ${nf0.format(f.distinct - f.values.length)} more values not kept</div>` : "") +
         (f.other_n ? `<div class="sub">${nf0.format(f.other_n)} more not told apart (too many distinct values)</div>` : "");
-    const why = !owner || state.data.imported ? "" : !can ? " · a warning has no lines of its own, so it can't filter by these"
+    const why = !owner || state.data.imported || SNAP ? "" : !can ? " · a warning has no lines of its own, so it can't filter by these"
         : f.unfiltered ? " · every value listed, not only the picked ones" : "";
     return `<div class="factbox" data-factbox="${esc(f.detail)}"><div class="facthead"><b>${esc(f.detail)}</b>` +
         `<span class="sub">${nf0.format(f.distinct)}${f.other_n ? "+" : ""} distinct · ${nf0.format(f.total)} in all${why}</span></div>` +
@@ -2053,7 +2075,7 @@ function factsSection(facts, what, owner, note, empty, sig) {
     for (const f of facts || []) f.sig = sig;
     lastFacts.facts = lastFacts.facts.filter(f => !(facts || []).some(g => g.detail === f.detail)).concat(facts || []);
     if (!facts || !facts.length) return `<div class="sub">${empty || `Nothing was collapsed into this ${what}: no ids, clients or numbers were told apart.`}</div>`;
-    const can = owner && !state.data.imported;
+    const can = owner && !state.data.imported && !SNAP;
     return `<div class="sub srcnote">${note || `The ${what} collapses these into one row; most frequent first.`}` +
         (can ? ` <b>Click to filter.</b>` : "") + `</div><div class="factgrid">` + facts.map(f => factTable(f, owner)).join("") + `</div>`;
 }
@@ -2115,7 +2137,7 @@ function openIssue(key) {
         {id: "details", label: "Details behind the grouping", html: `<div id="factsSection">${factsSection(r ? r.facts : [], "message template", owner, null, null, sig)}</div>`},
         {id: "ops", label: r ? `Parent operations (${nf0.format(r.ops_n)})` : "Parent operations", html: `<div class="pane-card">${r ? issueOpsTable(r) : `<div class="sub">No occurrence left with the current filters.</div>`}</div>`},
     ];
-    if (!state.data.imported) tabs.push({id: "raw", label: "Raw log lines", html: rawSection(r && r.sample)});
+    if (!state.data.imported && !SNAP) tabs.push({id: "raw", label: "Raw log lines", html: rawSection(r && r.sample)});
     showForm(key.level === "WARNING" ? "Warning details" : "Error details", sheet, tabs, key.level === "WARNING" ? "WARNING" : "ERROR");
     if (state.data.imported) return true;                               // no log behind an imported summary
     const p = selectionParams();
@@ -2126,6 +2148,7 @@ function openIssue(key) {
         if (seq !== detailSeq || !d.facts) return;
         $("#factsSection").innerHTML = factsSection(d.facts, "message template", owner, null, null, sig);
     }).catch(() => { /* the top values shown already will do */ });
+    if (SNAP) return true;
     if (r) loadRawLines("/api/issue_lines?" + p, r.n, false, {level: key.level, logger: key.logger, msg: key.message});
     else $("#rawOcc").innerHTML = `<div class="sub">No occurrence left with the current filters.</div>`;
     return true;
@@ -2226,7 +2249,7 @@ function openDetail(by, name) {
     ];
     if (grouped) tabs.push({id: "ops", label: "Operations", html: `<div class="pane-card" id="opsSection">${loading}</div>`});
     tabs.push({id: "sources", label: "Logged during", html: `<div class="pane-card" id="srcSection">${loading}</div><div id="loggedFacts">${loading}</div>`});
-    if (!state.data.imported) tabs.push({id: "raw", label: "Raw log lines", html: rawSection()});
+    if (!state.data.imported && !SNAP) tabs.push({id: "raw", label: "Raw log lines", html: rawSection()});
     showForm(DETAIL_TITLE[by], sheet, tabs, by);
     const owner = {by, name}, what = grouped ? GROUP_LABEL[by] : "operation name";
     const loggedNote = `Users and records named in the lines logged while ${grouped ? "its operations" : "it"} ran (ORM calls, warnings and their tracebacks), ` +
@@ -2258,7 +2281,7 @@ function openDetail(by, name) {
         if (grouped) { $("#opsSection").innerHTML = opsSection(d); setTabLabel("ops", `Operations (${nf0.format(d.top_ops.length)})`); }
         $("#srcSection").innerHTML = sourcesSection(d, grouped);
         if (d.sources.total) setTabLabel("sources", `Logged during (${nf0.format(d.sources.total)})`);
-        loadRawLines("/api/op_lines?" + p, r ? r.calls : 0, true, {by, name});
+        if (!SNAP) loadRawLines("/api/op_lines?" + p, r ? r.calls : 0, true, {by, name});
     }).catch(e => {                                                          // say so in every pane still waiting
         if (seq !== detailSeq) return;
         const msg = `<div class="sub err">Could not load the details: ${esc(e.message)}</div>`;
@@ -2471,7 +2494,8 @@ document.addEventListener("click", e => {
     if (t.closest("#addBtn") || t.closest("#drop")) return $("#picker").click();
     if (t.closest("#importBtn")) return $("#importPicker").click();
     if (t.closest("#resetBtn")) return resetAll();
-    if (t.closest("#exportBtn")) return exportSummary();
+    if (t.closest("#exportBtn")) return exportAs("/api/export?" + selectionParams(), "logtool-export.json");
+    if (t.closest("#exportHtmlBtn")) return exportHtml();
 });
 
 document.addEventListener("input", e => {
@@ -2549,5 +2573,14 @@ addEventListener("drop", e => {
 });
 
 $("#tableGroup").value = state.tableGroup;
-api("/api/only_db").then(j => { onlyDb = j.db || ""; renderOnlyDb(); renderDbs(); }).catch(() => {});
-refresh().catch(e => setNotice("Could not reach the server: " + e.message, true));
+if (SNAP) {                                       // an Export HTML page: open as the page was when it was exported
+    applyView(SNAP.view);
+    const iv = SNAP.analyze.interval;
+    state.interval = iv && {from: iv[0], to: iv[1]};
+    state.dbInit = true;
+    $("#tFrom").readOnly = $("#tTo").readOnly = true;
+    analyzeNow();
+} else {
+    api("/api/only_db").then(j => { onlyDb = j.db || ""; renderOnlyDb(); renderDbs(); }).catch(() => {});
+    refresh().catch(e => setNotice("Could not reach the server: " + e.message, true));
+}

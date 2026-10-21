@@ -1304,15 +1304,24 @@ class _Alias:
         return m[value]
 
 
-def _scrub_url(url, secrets):
-    """A raw path with its query values and token-like segments blanked (they can be access tokens); ids stay."""
+def _scrub_ids(text, alias, kind="id"):
+    """Every number in `text` replaced by a stable pseudonym (see _Alias): user and record ids, for Export HTML."""
+    return re.sub(r"\d+", lambda m: alias(kind, m.group()), text)
+
+
+def _scrub_url(url, secrets, alias=None):
+    """A raw path with its query values and token-like segments blanked (they can be access tokens); ids stay,
+    unless `alias` is given: then they become pseudonyms too (see _scrub_ids)."""
     path, q, query = url.partition("?")
     path = "/".join("<token>" if olp._TOKEN.match(p) and any(c.isdigit() for c in p) else p for p in path.split("/"))
+    if alias:
+        path = _scrub_ids(path, alias)
     return _scrub(path + ("?" + re.sub(r"=[^&]*", "=…", query) if q else ""), secrets)
 
 
-def _scrub_facts(facts, secrets, alias):
-    """_facts_json() output with clients and accounts pseudonymized (see _Alias) and free text scrubbed."""
+def _scrub_facts(facts, secrets, alias, ids=False):
+    """_facts_json() output with clients and accounts pseudonymized (see _Alias) and free text scrubbed.
+    ids: user and record ids (and the numbers behind a '#') too, for Export HTML."""
     def one(slot, v):
         if v == olp.FACT_OTHER:
             return v
@@ -1323,7 +1332,11 @@ def _scrub_facts(facts, secrets, alias):
         if slot == olp.F_LOGIN:
             return alias("user", v)
         if slot == olp.F_URL:
-            return _scrub_url(v, secrets)
+            return _scrub_url(v, secrets, alias if ids else None)
+        if ids and slot in (olp.F_USER, olp.F_LOGGED_USER):
+            return _scrub_ids(v, alias, "uid")
+        if ids and (slot in (olp.F_REC, olp.F_LOGGED_REC) or slot.endswith("#")):
+            return _scrub_ids(_scrub(v, secrets), alias)
         return _scrub(v, secrets)
     return [dict(f, detail=_scrub(f["detail"], secrets),
                  values=[[one(f["detail"], e[0]), e[1]] + ([[alias("user", x) for x in e[2]]] if len(e) > 2 else [])
@@ -1341,12 +1354,12 @@ def _scrub_timeline_op(o, secrets):
                 operation=_scrub(o["operation"], secrets))
 
 
-def _scrub_issue(i, secrets, alias):
+def _scrub_issue(i, secrets, alias, ids=False):
     return {"level": i["level"], "logger": _scrub(i["logger"], secrets), "exc": _scrub(i["exc"], secrets),
             "src": _scrub(i["src"], secrets), "message": _scrub(i["message"], secrets), "n": i["n"],
             "first": i["first"], "last": i["last"], "ops_n": i["ops_n"], "unattributed": i["unattributed"],
             "ops": [[_scrub(op, secrets), n] for op, n in i["ops"]], "hist": i["hist"],
-            "facts": _scrub_facts(i["facts"], secrets, alias)}
+            "facts": _scrub_facts(i["facts"], secrets, alias, ids)}
 
 
 def _export_clients(prof, secrets, alias, base):
@@ -1462,6 +1475,82 @@ def export(exclude_db, exclude_file, interval, flt=NOFILT):
             # show it; older exports simply lack this key and import with no histogram, as before.
             "hist": timeline,
         }
+
+
+HTML_DETAILS = 50       # rows of each table (operations, apps, types, errors) whose details popup Export HTML carries
+HTML_NOTE = ("Exported %s UTC: a read-only copy of the page. Other databases and the raw log lines are left out; "
+             "IPs, sessions, logins, emails, user and record ids are replaced by pseudonyms. Details are kept for "
+             "the top %d rows of each table." % ("%s", HTML_DETAILS))
+
+
+def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=None, desc=""):
+    """What Export HTML builds into the page (see the snapshot in index.html): the analyze() answer the page
+    shows now, cut down to the selected databases (the others are not even named), plus the details popup of
+    the top HTML_DETAILS rows of each table. Free text is scrubbed like export()'s (the other databases' and the
+    files' names, emails, IPs), and clients, accounts, user and record ids are pseudonymized. view: the page's
+    view settings (see viewState() in app.js), whose item names are scrubbed the same way so they still match."""
+    a = analyze(exclude_db, exclude_file, interval, False, flt=flt, pins=pins)
+    if a.get("imported"):
+        raise NoData("an imported summary cannot be exported as HTML")
+    with LOCK:
+        files, inc, dbs, excl = _select(set(a["excluded_db"]), exclude_file, False)
+        ids, excl = tuple(f["id"] for f in inc), frozenset(excl)
+        iv = tuple(a["interval"]) if a["interval"] else None
+        prof = _heavy(_prof_for(inc, ids, excl, iv, flt))
+        prof0 = _heavy(_prof_for(inc, ids, excl, iv)) if flt[0] else prof
+    keep = [d for d in dbs if d[0] not in excl]
+    secrets = [s for s in _secret_names({d for d, _ in dbs if d in excl and d not in ("?", "None")}, files)
+               if s not in {d for d, _ in keep}]
+    alias = _Alias()
+
+    def scrub(text):
+        return _scrub(text, secrets)
+
+    def facts(f):
+        return _scrub_facts(f, secrets, alias, ids=True)
+
+    def op_detail(by, name):
+        d = _detail(prof, by, name, _facts_view(prof, prof0, by, name, flt), _facts_view(prof, prof0, by, name, flt, logged=True))
+        return dict(d, name=scrub(name), examples=[], facts=facts(d.get("facts", [])), logged_facts=facts(d.get("logged_facts", [])),
+                    top_ops=[dict(o, operation=scrub(o["operation"])) for o in d.get("top_ops", [])],
+                    sources=dict(d["sources"], items=[dict(e, key=scrub(e["key"]), sample="", ops=[[scrub(o), n] for o, n in e["ops"]])
+                                                      for e in d["sources"]["items"]]) if d["found"] else None)
+
+    v = a["view"]
+    details = {}
+    with LOCK:
+        for by, rows in (("operation", v["rows"]), ("app", v["groups"]["app"]), ("family", v["groups"]["family"])):
+            names = [r[by] for r in sorted(rows, key=lambda r: -r["total_s"])[:HTML_DETAILS]]
+            for name in names + ((pins or {}).get("ops", []) if by == "operation" else []):
+                details["%s\x1f%s" % (by, scrub(name))] = op_detail(by, name)
+        for i in v["issues"][:HTML_DETAILS] + [i for i in v["issues"][HTML_DETAILS:] if i.get("pinned")]:
+            key = (i["level"], i["logger"], i["message"])
+            details["\x1f".join(("issue", key[0], scrub(key[1]), scrub(key[2])))] = {
+                "found": True, "facts": facts(_facts_view(prof, prof0, "issue", key, flt))}
+
+    view = dict(view or {})
+    for it in view.get("items", []):
+        if isinstance(it.get("issue"), list) and len(it["issue"]) == 3:
+            it["issue"] = [it["issue"][0], scrub(it["issue"][1]), scrub(it["issue"][2])]
+        for k in ("operation", "app", "type", "search"):
+            if isinstance(it.get(k), str):
+                it[k] = scrub(it[k])
+    for part in ("table", "errors"):                    # a search typed into the page may hold an IP or an email
+        if isinstance(view.get(part), dict) and isinstance(view[part].get("search"), str):
+            view[part] = dict(view[part], search=scrub(view[part]["search"]))
+    return {
+        "note": HTML_NOTE % datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M"),
+        "filter": scrub(desc),
+        "view": view,
+        "details": details,
+        "analyze": dict(a, files=[], databases=keep, excluded_db=[], hist_key="snapshot",
+                        view=dict(v, files=[None] * len(v["files"]), rows_key="snapshot",
+                                  rows=[_scrub_row(r, secrets) for r in v["rows"]],
+                                  groups={k: [_scrub_row(r, secrets) for r in rows] for k, rows in v["groups"].items()},
+                                  issues=[dict(i, **_scrub_issue(i, secrets, alias, ids=True), sample="") for i in v["issues"]]),
+                        hist=dict(a["hist"], ops=[_scrub_timeline_op(o, secrets) for o in a["hist"]["ops"]]),
+                        pinned_ops=[_scrub_timeline_op(o, secrets) for o in a["pinned_ops"]]),
+    }
 
 
 def _file_json(f):
@@ -2032,9 +2121,40 @@ def api_export():
     except Exception as e:                                   # a bad log must not kill the server
         logging.getLogger("logtool").exception("export failed")
         return jsonify({"error": "%s: %s" % (type(e).__name__, e)}), 500
-    resp = Response(json.dumps(data, indent=2, ensure_ascii=False), mimetype="application/json")
-    resp.headers["Content-Disposition"] = 'attachment; filename="logtool-export-%s.json"' % \
-        datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return _attachment(json.dumps(data, indent=2, ensure_ascii=False), "application/json", "json")
+
+
+@app.get("/api/export_html")
+def api_export_html():
+    """The page itself, standalone, with the current selection built in (see export_html())."""
+    try:
+        _load_pending()
+        _prepare_filter(_ff_arg())
+        try:
+            view = json.loads(request.args.get("view") or "null")
+        except ValueError:
+            raise NoData("view must be JSON")
+        if not isinstance(view, dict) or not isinstance(view.get("items"), list):
+            raise NoData("view must be the page's view settings")
+        snapshot = export_html(set(request.args.getlist("exclude_db")), set(request.args.getlist("exclude_file")),
+                               _interval_arg(), _ff_arg(), _pins_arg(), view, request.args.get("desc", "")[:500])
+        static = {}
+        for name in ("style.css", "app.js"):
+            with open(os.path.join(app.static_folder, name), encoding="utf-8") as fh:
+                static[name] = fh.read()
+    except NoData as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:                                   # a bad log must not kill the server
+        logging.getLogger("logtool").exception("HTML export failed")
+        return jsonify({"error": "%s: %s" % (type(e).__name__, e)}), 500
+    page = render_template("index.html", boot=BOOT_ID, snapshot=snapshot, css=static["style.css"], js=static["app.js"])
+    return _attachment(page, "text/html", "html")
+
+
+def _attachment(body, mimetype, ext):
+    resp = Response(body, mimetype=mimetype)
+    resp.headers["Content-Disposition"] = 'attachment; filename="logtool-export-%s.%s"' % (
+        datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"), ext)
     return resp
 
 

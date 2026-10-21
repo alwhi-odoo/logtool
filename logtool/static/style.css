@@ -101,6 +101,10 @@ input:disabled { opacity: .45; }
 .dropzone.empty .progress { width: min(360px, 80%); }
 .dropzone.over { border-color: var(--accent); background: #1f2430; color: var(--text); }
 
+/* an Export HTML page: what needs the server is left out, the databases box takes the whole row */
+html.snapshot .live-only { display: none !important; }
+html.snapshot .toprow { grid-template-columns: minmax(0, 1fr); }
+
 /* nothing loaded yet: a plain grey page with a quiet grid of dots, so it is not a flat void */
 html.nothing-loaded body {
     background-color: #101112;

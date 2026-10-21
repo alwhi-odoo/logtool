@@ -1,10 +1,11 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en"{% if snapshot %} class="snapshot"{% endif %}>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Odoo Log Summary</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    {% if snapshot %}<style>{{ css|safe }}</style>
+    {% else %}<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">{% endif %}
 </head>
 <body data-boot="{{ boot }}">
 <header class="topbar">
@@ -15,13 +16,15 @@
         <span class="k">→</span>
         <input type="text" id="tTo" placeholder="YYYY-MM-DD HH:MM:SS" spellcheck="false" autocomplete="off">
         <span class="tag" id="ivTag"></span>
-        <button class="btn ghost" id="clearTop" hidden data-tip="Remove the time interval and show the whole selection again.">Clear</button>
+        <button class="btn ghost live-only" id="clearTop" hidden data-tip="Remove the time interval and show the whole selection again.">Clear</button>
     </div>
     <span class="tag" id="tzTag" hidden data-tip="Bucket times in the histogram below are shown in this timezone. Everything else (time interval inputs, stats, log lines) stays UTC, matching the log."></span>
-    <div class="topbar-actions">
+    <div class="topbar-actions live-only">
         <button class="btn accent" id="clearFacts" hidden></button>
         <button class="btn ghost" id="exportBtn" hidden
                 data-tip="Downloads the current summary as JSON, safe to hand to someone else or an AI: no database or file names, no raw log lines. Follows whatever files / databases / time interval / excluded operations are selected right now.">Export summary</button>
+        <button class="btn ghost" id="exportHtmlBtn" hidden
+                data-tip="Downloads this page as one standalone .html file to open in any browser, with only the selected databases in it (the others are not even named). It opens read-only, as it is now: no other time interval, filter or raw log lines, and the details of the top rows only. IPs, sessions, logins, emails, user and record ids are replaced by pseudonyms.">Export HTML</button>
         <button class="btn ghost" id="importBtn"
                 data-tip="Load a summary saved earlier with Export summary (a small .json file) instead of re-uploading and re-parsing the original logs. It opens read-only: no database, time-interval or histogram filtering.">Import summary</button>
         <button class="btn primary" id="addBtn">+ Add logs</button>
@@ -37,7 +40,7 @@
     <section class="group" id="filterGroup">
         <h3 class="group-title">Data selection</h3>
         <div class="toprow">
-            <div class="card box" id="filesBox">
+            <div class="card box live-only" id="filesBox">
                 <div class="box-head"><h2>Files</h2></div>
                 <div class="dropzone empty" id="drop" role="button" tabindex="0" aria-label="Add log files">
                     <span id="dropText">Drop Odoo log files here (plain, .gz, .bz2), or a summary exported earlier (.json), or click to choose them</span>
@@ -48,7 +51,7 @@
 
             <div class="card box" id="dbBox">
                 <div class="box-head"><h2>Databases</h2><span class="sub" id="dbSub"></span></div>
-                <div class="onlydb">
+                <div class="onlydb live-only">
                     <label for="onlyDb" class="sub"
                            data-tip="<b>Only read one database</b><br>Set it before adding big logs that hold many databases: the lines of every other database (and their tracebacks) are skipped as soon as their header is read, so loading is faster and uses less memory. Lines without a database are always read. Changing it reads the loaded logs again.">Only read database</label>
                     <input type="text" id="onlyDb" placeholder="every database" spellcheck="false" autocomplete="off">
@@ -57,7 +60,7 @@
                             data-tip="Pick a log file (plain or .gz) to list the databases it holds and how many lines each has. The file is read here in the browser, not loaded.">Find databases in a log file…</button>
                     <input type="file" id="dbScanPicker" multiple hidden>
                 </div>
-                <div class="dbscan" id="dbScan" hidden>
+                <div class="dbscan live-only" id="dbScan" hidden>
                     <div class="dbscan-head">
                         <input type="search" id="dbScanFilter" placeholder="Search databases…" spellcheck="false" autocomplete="off">
                         <span class="sub" id="dbScanSub"></span>
@@ -82,9 +85,9 @@
             <h2>Requests over time <span class="count" id="histCount"></span></h2>
             <div class="panel-tools">
                 <button class="btn ghost" id="histFit">Fit all buckets</button>
-                <button class="btn ghost" id="clearHist" hidden data-tip="Remove the time interval and show the whole selection again.">Clear interval</button>
-                <button class="btn ghost" id="histFocusSel" hidden data-tip="Focus on the interval selected inside the focused chart: a narrower span, with finer buckets.">Focus interval</button>
-                <button class="btn ghost" id="histFocus" disabled>Focus interval</button>
+                <button class="btn ghost live-only" id="clearHist" hidden data-tip="Remove the time interval and show the whole selection again.">Clear interval</button>
+                <button class="btn ghost live-only" id="histFocusSel" hidden data-tip="Focus on the interval selected inside the focused chart: a narrower span, with finer buckets.">Focus interval</button>
+                <button class="btn ghost live-only" id="histFocus" disabled>Focus interval</button>
                 <div class="menu-wrap">
                     <button class="select-like" id="histSeriesBtn" data-tip="What the chart plots: <b>total</b> plus one item per search, right-clicked table row or error, each with its own bars and lines (average / total ms, split into Python and SQL, and requests).">Chart items &amp; series ▾</button>
                     <div class="menu big" id="histSeriesMenu" hidden role="dialog" aria-labelledby="serTitle">
@@ -110,7 +113,7 @@
         <div class="panel-body" id="histBody">
             <div class="hist-key" id="histKey" aria-label="Chart key"></div>
             <div class="hist-scroll"><svg id="hist" role="img" aria-label="Requests over time"></svg></div>
-            <div class="sub hist-note">Click a bar to start a time range, then a second bar (or the same one again) to select it; Esc cancels. <b>Focus interval</b> then shows just that range, with finer buckets.</div>
+            <div class="sub hist-note live-only">Click a bar to start a time range, then a second bar (or the same one again) to select it; Esc cancels. <b>Focus interval</b> then shows just that range, with finer buckets.</div>
         </div>
     </section>
 
@@ -221,6 +224,8 @@
 
 <div id="busy" role="status" aria-live="polite" hidden><span class="spin"></span><span id="busyText">Working…</span></div>
 <div id="tip" role="tooltip"></div>
-<script src="{{ url_for('static', filename='app.js') }}"></script>
+{% if snapshot %}<script type="application/json" id="snapshot">{{ snapshot|tojson }}</script>
+<script>{{ js|safe }}</script>
+{% else %}<script src="{{ url_for('static', filename='app.js') }}"></script>{% endif %}
 </body>
 </html>
