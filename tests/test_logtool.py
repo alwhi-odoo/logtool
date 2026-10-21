@@ -385,30 +385,33 @@ def test_export_pseudonymizes_and_explains(c):
 
 
 @case
-def test_export_html_shows_only_the_selected_database_pseudonymized(c):
+def test_export_html_shows_only_the_selected_database_and_censors_lines_without_one(c):
     import json
     import re
     from urllib.parse import quote
     other = b"2026-09-14 13:09:00,000 8 WARNING othercustomer odoo.x: from 10.9.9.9 at othercustomer\n"
-    nodb = b"2026-09-14 13:09:30,000 9 WARNING ? odoo.sql_db: Connection to the database othercustomer failed\n"
+    nodb = (b"2026-09-14 13:09:30,000 9 WARNING ? odoo.sql_db: Connection to the database othercustomer failed for bob@corp.com\n"
+            b'2026-09-14 13:09:40,000 9 INFO ? werkzeug: 10.8.8.8 - - [14/Sep/2026 13:09:40] '
+            b'"GET /web/database/selector HTTP/1.1" 200 - 2 0.01 0.02\n')
     upload(c, "acme-logs.log", LOGIN + AUTH + DENIED + IMG % (b"7", b"0.1") + CRON + other + nodb)
     analyze(c)
-    view = {"items": [{"issue": ["WARNING", "odoo.sql_db", "Connection to the database othercustomer failed"]}],
-            "table": {"search": "10.0.0.1"}}
+    view = {"items": [{"issue": ["WARNING", "odoo.sql_db", "Connection to the database othercustomer failed for bob@corp.com"]}]}
     r = c.get("/api/export_html?exclude_db=othercustomer&desc=x&view=" + quote(json.dumps(view)))
     assert r.status_code == 200 and r.mimetype == "text/html" and ".html" in r.headers["Content-Disposition"], r.get_data()[:300]
     page = r.get_data(as_text=True)
-    for secret in ("othercustomer", "10.0.0.", "10.9.9.9", "jane@", "BK1AC94d", "acme-logs", 'src="/static'):
+    for secret in ("othercustomer", "10.9.9.9", "10.8.8.8", "bob@corp.com", 'src="/static'):
         assert secret not in page, secret
     snap = json.loads(re.search(r'<script type="application/json" id="snapshot">(.*?)</script>', page, re.S).group(1))
     a = snap["analyze"]
     assert {d[0] for d in a["databases"]} == {"mydb", "-"} and a["excluded_db"] == [] and not a["files"], a["databases"]
     assert snap["view"]["items"][0]["issue"][2] in {i["message"] for i in a["view"]["issues"]}, snap["view"]
-    issue = next(d for k, d in snap["details"].items() if "top-secret" in k)
+    issue = next(d for k, d in snap["details"].items() if "top-secret" in k)    # the selected database: as it is
     f = facts(issue["facts"])
-    assert f["user id"] and all(v.startswith("uid-") for v in f["user id"]) and "42" not in str(f["records"]), f
+    assert "69" in f["user id"] and "10.0.0.7" in page and "jane@example.com" in page, f
     img = snap["details"]["operation\x1fimage res.partner.avatar_128"]
-    assert all("/7/" not in u and "/id-" in u for u in facts(img["facts"])["URL"]) and not img["examples"], img
+    assert "/web/image/res.partner/7/avatar_128" in facts(img["facts"])["URL"] and img["examples"], img
+    sel = next(d for k, d in snap["details"].items() if "selector" in k)        # a line without a database: censored
+    assert [ip[:3] for ip in facts(sel["facts"])["client IP"]] == ["ip-"] and not sel["examples"], sel
     assert c.get("/api/export_html?view=" + quote("[]")).status_code == 400
 
 

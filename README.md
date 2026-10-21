@@ -172,10 +172,11 @@ particular log cannot show (no DEBUG lines, no session per request, ...). `field
 
 *Export HTML* downloads the page itself as one standalone `.html` file that opens in any browser, offline. It shows
 the current selection as it is on screen (time interval, filters, chart items, table and error settings) and only
-the selected databases: the others are not even named. The selected database names stay; file names and raw log
-lines are left out. Free text is scrubbed like *Export summary*'s (the other databases' and the files' names, IPs,
-emails), and client IPs, sessions, logins, user ids and record ids become stable pseudonyms (`ip-3`, `uid-1`,
-`sale.order(id-4)`).
+the selected databases: the others are not even named. File names and raw log lines are left out. The selected
+databases' own data is kept as it is. What lines without a database (*None*) logged is censored: every operation and
+message that shows up in such a line (and the apps and types they belong to) is scrubbed like *Export summary*'s
+(the other databases' and the files' names, IPs, emails), with client IPs, sessions, logins, user ids and record ids
+as stable pseudonyms (`ip-3`, `uid-1`, `sale.order(id-4)`).
 
 It opens read-only: sorting, filtering and grouping the tables, chart items, bucket size and timezone still work;
 picking another database or time interval, focus, item filters, the filter editor and raw log lines do not. The

@@ -337,8 +337,9 @@ versions. Requirements on it:
   A file that is not a valid export shall be marked as such.
 * **FR-EXP-4** *Export HTML* shall download the page as one standalone HTML file (no request to any server) showing
   the current selection read-only, with the page's view settings. It shall name no database other than the
-  selected ones, contain no file names and no raw log lines, scrub free text as in FR-EXP-2 and also replace user
-  and record ids by stable pseudonyms. It shall carry the details of the top 50 rows of each table.
+  selected ones and contain no file names and no raw log lines. The selected databases' data shall be kept as it
+  is; the operations and messages that lines without a database show up in shall be scrubbed as in FR-EXP-2, with
+  user and record ids also replaced by stable pseudonyms. It shall carry the details of the top 50 rows of each table.
 
 ### 3.3 Non-functional requirements
 

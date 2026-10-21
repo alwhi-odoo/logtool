@@ -1478,17 +1478,19 @@ def export(exclude_db, exclude_file, interval, flt=NOFILT):
 
 
 HTML_DETAILS = 50       # rows of each table (operations, apps, types, errors) whose details popup Export HTML carries
-HTML_NOTE = ("Exported %s UTC: a read-only copy of the page. Other databases and the raw log lines are left out; "
-             "IPs, sessions, logins, emails, user and record ids are replaced by pseudonyms. Details are kept for "
-             "the top %d rows of each table." % ("%s", HTML_DETAILS))
+HTML_NOTE = ("Exported %s UTC: a read-only copy of the page, of the selected databases only; the raw log lines are "
+             "not in it. What lines without a database ('None') logged is censored: IPs, sessions, logins, emails, user "
+             "and record ids are replaced by pseudonyms. Details are kept for the top %d rows of each table." % ("%s", HTML_DETAILS))
 
 
 def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=None, desc=""):
     """What Export HTML builds into the page (see the snapshot in index.html): the analyze() answer the page
     shows now, cut down to the selected databases (the others are not even named), plus the details popup of
-    the top HTML_DETAILS rows of each table. Free text is scrubbed like export()'s (the other databases' and the
-    files' names, emails, IPs), and clients, accounts, user and record ids are pseudonymized. view: the page's
-    view settings (see viewState() in app.js), whose item names are scrubbed the same way so they still match."""
+    the top HTML_DETAILS rows of each table. The selected databases' own data is kept as it is; only what lines
+    without a database (NONE_DB) logged -- the rows and messages they show up in -- is censored like export()'s
+    (the other databases' and the files' names, emails, IPs blanked), with clients, accounts, user and record ids
+    pseudonymized too. view: the page's view settings (see viewState() in app.js), whose items are censored the
+    same way so they still match."""
     a = analyze(exclude_db, exclude_file, interval, False, flt=flt, pins=pins)
     if a.get("imported"):
         raise NoData("an imported summary cannot be exported as HTML")
@@ -1498,23 +1500,43 @@ def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=
         iv = tuple(a["interval"]) if a["interval"] else None
         prof = _heavy(_prof_for(inc, ids, excl, iv, flt))
         prof0 = _heavy(_prof_for(inc, ids, excl, iv)) if flt[0] else prof
+        nodb = (_prof_for(inc, ids, frozenset(d for d, _ in dbs if d != NONE_DB), iv, flt)
+                if NONE_DB in {d for d, _ in dbs} - excl else None)
     keep = [d for d in dbs if d[0] not in excl]
     secrets = [s for s in _secret_names({d for d, _ in dbs if d in excl and d not in ("?", "None")}, files)
                if s not in {d for d, _ in keep}]
     alias = _Alias()
+    none_ops = set(nodb.det) if nodb else set()
+    tainted = {"operation": none_ops, "issue": set(nodb.issues) if nodb else set(),
+               "app": {prof.det_app.get(o) for o in none_ops}, "family": {prof.det_fam.get(o) for o in none_ops}}
 
-    def scrub(text):
+    def txt(text):
         return _scrub(text, secrets)
+
+    def scrub(by, name):
+        return txt(name) if name in tainted[by] else name
+
+    def issue_key(k):
+        return (k[0], txt(k[1]), txt(k[2])) if tuple(k) in tainted["issue"] else tuple(k)
 
     def facts(f):
         return _scrub_facts(f, secrets, alias, ids=True)
 
     def op_detail(by, name):
         d = _detail(prof, by, name, _facts_view(prof, prof0, by, name, flt), _facts_view(prof, prof0, by, name, flt, logged=True))
-        return dict(d, name=scrub(name), examples=[], facts=facts(d.get("facts", [])), logged_facts=facts(d.get("logged_facts", [])),
-                    top_ops=[dict(o, operation=scrub(o["operation"])) for o in d.get("top_ops", [])],
-                    sources=dict(d["sources"], items=[dict(e, key=scrub(e["key"]), sample="", ops=[[scrub(o), n] for o, n in e["ops"]])
+        if name not in tainted[by]:
+            return d
+        return dict(d, name=txt(name), examples=[], facts=facts(d.get("facts", [])), logged_facts=facts(d.get("logged_facts", [])),
+                    top_ops=[dict(o, operation=scrub("operation", o["operation"])) for o in d.get("top_ops", [])],
+                    sources=dict(d["sources"], items=[dict(e, key=txt(e["key"]), sample="", ops=[[txt(o), n] for o, n in e["ops"]])
                                                       for e in d["sources"]["items"]]) if d["found"] else None)
+
+    def issue(i):
+        key = (i["level"], i["logger"], i["message"])
+        return dict(i, **_scrub_issue(i, secrets, alias, ids=True), sample="") if key in tainted["issue"] else i
+
+    def op(o):
+        return _scrub_timeline_op(o, secrets) if o["operation"] in none_ops else o
 
     v = a["view"]
     details = {}
@@ -1522,34 +1544,31 @@ def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=
         for by, rows in (("operation", v["rows"]), ("app", v["groups"]["app"]), ("family", v["groups"]["family"])):
             names = [r[by] for r in sorted(rows, key=lambda r: -r["total_s"])[:HTML_DETAILS]]
             for name in names + ((pins or {}).get("ops", []) if by == "operation" else []):
-                details["%s\x1f%s" % (by, scrub(name))] = op_detail(by, name)
+                details["%s\x1f%s" % (by, scrub(by, name))] = op_detail(by, name)
         for i in v["issues"][:HTML_DETAILS] + [i for i in v["issues"][HTML_DETAILS:] if i.get("pinned")]:
             key = (i["level"], i["logger"], i["message"])
-            details["\x1f".join(("issue", key[0], scrub(key[1]), scrub(key[2])))] = {
-                "found": True, "facts": facts(_facts_view(prof, prof0, "issue", key, flt))}
+            f = _facts_view(prof, prof0, "issue", key, flt)
+            details["\x1f".join(("issue",) + issue_key(key))] = {
+                "found": True, "facts": facts(f) if key in tainted["issue"] else f}
 
     view = dict(view or {})
     for it in view.get("items", []):
         if isinstance(it.get("issue"), list) and len(it["issue"]) == 3:
-            it["issue"] = [it["issue"][0], scrub(it["issue"][1]), scrub(it["issue"][2])]
-        for k in ("operation", "app", "type", "search"):
+            it["issue"] = list(issue_key(it["issue"]))
+        for k, by in (("operation", "operation"), ("app", "app"), ("type", "family")):
             if isinstance(it.get(k), str):
-                it[k] = scrub(it[k])
-    for part in ("table", "errors"):                    # a search typed into the page may hold an IP or an email
-        if isinstance(view.get(part), dict) and isinstance(view[part].get("search"), str):
-            view[part] = dict(view[part], search=scrub(view[part]["search"]))
+                it[k] = scrub(by, it[k])
     return {
         "note": HTML_NOTE % datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M"),
-        "filter": scrub(desc),
+        "filter": desc,
         "view": view,
         "details": details,
         "analyze": dict(a, files=[], databases=keep, excluded_db=[], hist_key="snapshot",
                         view=dict(v, files=[None] * len(v["files"]), rows_key="snapshot",
-                                  rows=[_scrub_row(r, secrets) for r in v["rows"]],
-                                  groups={k: [_scrub_row(r, secrets) for r in rows] for k, rows in v["groups"].items()},
-                                  issues=[dict(i, **_scrub_issue(i, secrets, alias, ids=True), sample="") for i in v["issues"]]),
-                        hist=dict(a["hist"], ops=[_scrub_timeline_op(o, secrets) for o in a["hist"]["ops"]]),
-                        pinned_ops=[_scrub_timeline_op(o, secrets) for o in a["pinned_ops"]]),
+                                  rows=[dict(r, operation=scrub("operation", r["operation"])) for r in v["rows"]],
+                                  issues=[issue(i) for i in v["issues"]]),
+                        hist=dict(a["hist"], ops=[op(o) for o in a["hist"]["ops"]]),
+                        pinned_ops=[op(o) for o in a["pinned_ops"]]),
     }
 
 

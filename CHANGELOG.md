@@ -8,8 +8,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **Export HTML**: downloads the page as one standalone, read-only `.html` file of the current selection. Only the
-  selected databases are in it (the others are not named); IPs, sessions, logins, emails, user and record ids are
-  pseudonymized; the details popup is kept for the top 50 rows of each table.
+  selected databases are in it (the others are not named), as they are; what lines without a database logged is
+  censored (IPs, sessions, logins, emails, user and record ids pseudonymized); the details popup is kept for the top
+  50 rows of each table.
 
 ## [1.2.0] - 2026-10-11
 
