@@ -192,7 +192,7 @@ function snapApi(url) {
     if (path === "/api/analyze") return structuredClone(SNAP.analyze);
     if (path === "/api/timeline" && SNAP.focus) return structuredClone(SNAP.focus);
     if (["/api/detail", "/api/issue_detail"].includes(path) && SNAP.details[key.join("\x1f")]) return SNAP.details[key.join("\x1f")];
-    throw new Error("this HTML export only carries the details of the top rows of each table");
+    throw new Error("not in this HTML export, which carries the details of the busiest rows of each table and of every cron, automation and module-loading operation only");
 }
 
 async function api(url, opts) {

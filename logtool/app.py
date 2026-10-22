@@ -1504,10 +1504,13 @@ def export(exclude_db, exclude_file, interval, flt=NOFILT):
         }
 
 
-HTML_DETAILS = 50       # rows of each table (operations, apps, types, errors) whose details popup Export HTML carries
+HTML_DETAILS = 50       # rows of each table (operations, apps, types, errors) whose details popup Export HTML carries,
+                        # plus every job operation (cron, automation, module loading): they rank low by total time, yet
+                        # the type 'cron' lists them all, and their details are small
 HTML_NOTE = ("Exported %s UTC: a read-only copy of the page, of the selected databases only; the raw log lines are "
              "not in it. What lines without a database ('None') logged is censored: IPs, sessions, logins, emails, user "
-             "and record ids are replaced by pseudonyms. Details are kept for the top %d rows of each table." % ("%s", HTML_DETAILS))
+             "and record ids are replaced by pseudonyms. Details are kept for the top %d rows of each table and every "
+             "cron, automation and module-loading operation." % ("%s", HTML_DETAILS))
 
 
 def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=None, desc=""):
@@ -1574,7 +1577,9 @@ def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=
     with LOCK:
         for by, rows in (("operation", v["rows"]), ("app", v["groups"]["app"]), ("family", v["groups"]["family"])):
             names = [r[by] for r in sorted(rows, key=lambda r: -r["total_s"])[:HTML_DETAILS]]
-            for name in names + ((pins or {}).get("ops", []) if by == "operation" else []):
+            if by == "operation":
+                names += [r["operation"] for r in rows if r["family"] in olp.JOB_KINDS] + (pins or {}).get("ops", [])
+            for name in dict.fromkeys(names):
                 details["%s\x1f%s" % (by, scrub(by, name))] = op_detail(by, name)
         for i in v["issues"][:HTML_DETAILS] + [i for i in v["issues"][HTML_DETAILS:] if i.get("pinned")]:
             key = (i["level"], i["logger"], i["message"])
