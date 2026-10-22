@@ -185,11 +185,13 @@ function busy(key, text) {
 // An Export HTML page (see export_html in app.py) has no server: what it built in answers instead
 const SNAP = (el => el && JSON.parse(el.textContent))($("#snapshot"));
 function snapApi(url) {
-    const u = new URL(url, location.href), q = u.searchParams;
-    const key = u.pathname === "/api/issue_detail" ? ["issue", q.get("level"), q.get("logger"), q.get("msg")] : [q.get("by"), q.get("name")];
-    if (u.pathname === "/api/analyze") return structuredClone(SNAP.analyze);
-    if (u.pathname === "/api/timeline" && SNAP.focus) return structuredClone(SNAP.focus);
-    if (["/api/detail", "/api/issue_detail"].includes(u.pathname) && SNAP.details[key.join("\x1f")]) return SNAP.details[key.join("\x1f")];
+    // the path is read from the request itself, never resolved against the page's own address: on Windows that is
+    // file:///C:/..., which would turn "/api/analyze" into "/C:/api/analyze"
+    const [path, query] = url.split("?"), q = new URLSearchParams(query);
+    const key = path === "/api/issue_detail" ? ["issue", q.get("level"), q.get("logger"), q.get("msg")] : [q.get("by"), q.get("name")];
+    if (path === "/api/analyze") return structuredClone(SNAP.analyze);
+    if (path === "/api/timeline" && SNAP.focus) return structuredClone(SNAP.focus);
+    if (["/api/detail", "/api/issue_detail"].includes(path) && SNAP.details[key.join("\x1f")]) return SNAP.details[key.join("\x1f")];
     throw new Error("this HTML export only carries the details of the top rows of each table");
 }
 
