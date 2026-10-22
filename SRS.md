@@ -339,7 +339,8 @@ versions. Requirements on it:
   the current selection read-only, with the page's view settings. It shall name no database other than the
   selected ones and contain no file names and no raw log lines. The selected databases' data shall be kept as it
   is; the operations and messages that lines without a database show up in shall be scrubbed as in FR-EXP-2, with
-  user and record ids also replaced by stable pseudonyms. It shall carry the details of the top 50 rows of each table.
+  user and record ids also replaced by stable pseudonyms. It shall carry the details of the top 100
+  operations, of every cron, automation and module-loading operation, and of the top 50 apps, types and errors.
 
 ### 3.3 Non-functional requirements
 

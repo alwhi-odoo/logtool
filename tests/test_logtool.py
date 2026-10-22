@@ -430,11 +430,11 @@ def test_export_html_shows_only_the_selected_database_and_censors_lines_without_
     f = snap["focus"]
     assert snap["view"]["focus"] == [f["from"], f["to"]] == [w[0] + 60, w[0] + 180] and f["base"] == 1, f
     assert all(f["from"] // 60 <= m < -(-f["to"] // 60) for m, *_ in f["all"]), f["all"]      # (its last minute: whole)
-    was, A.HTML_DETAILS = A.HTML_DETAILS, 0                                     # past the top rows: every job still has its details
+    was, A.HTML_OP_DETAILS = A.HTML_OP_DETAILS, 0                               # past the top rows: every job still has its details
     try:
         r = c.get("/api/export_html?exclude_db=othercustomer&view=" + quote(json.dumps({"items": []})))
     finally:
-        A.HTML_DETAILS = was
+        A.HTML_OP_DETAILS = was
     det = json.loads(re.search(r'id="snapshot">(.*?)</script>', r.get_data(as_text=True), re.S).group(1))["details"]
     assert "operation\x1fcron: Credit Check" in det and "operation\x1fimage res.partner.avatar_128" not in det, list(det)
     assert c.get("/api/export_html?view=" + quote("[]")).status_code == 400

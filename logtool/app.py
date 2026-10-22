@@ -1504,19 +1504,20 @@ def export(exclude_db, exclude_file, interval, flt=NOFILT):
         }
 
 
-HTML_DETAILS = 50       # rows of each table (operations, apps, types, errors) whose details popup Export HTML carries,
-                        # plus every job operation (cron, automation, module loading): they rank low by total time, yet
-                        # the type 'cron' lists them all, and their details are small
+HTML_DETAILS = 50       # rows of the apps, types and errors tables whose details popup Export HTML carries ...
+HTML_OP_DETAILS = 100   # ... and of the operations table, plus every job operation (cron, automation, module loading):
+                        # they rank low by total time, yet the type 'cron' lists them all, and their details are small
 HTML_NOTE = ("Exported %s UTC: a read-only copy of the page, of the selected databases only; the raw log lines are "
              "not in it. What lines without a database ('None') logged is censored: IPs, sessions, logins, emails, user "
-             "and record ids are replaced by pseudonyms. Details are kept for the top %d rows of each table and every "
-             "cron, automation and module-loading operation." % ("%s", HTML_DETAILS))
+             "and record ids are replaced by pseudonyms. Details are kept for the top %d operations, every cron, "
+             "automation and module-loading operation, and the top %d apps, types and errors."
+             % ("%s", HTML_OP_DETAILS, HTML_DETAILS))
 
 
 def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=None, desc=""):
     """What Export HTML builds into the page (see the snapshot in index.html): the analyze() answer the page
     shows now, cut down to the selected databases (the others are not even named), plus the details popup of
-    the top HTML_DETAILS rows of each table. The selected databases' own data is kept as it is; only what lines
+    the top rows of each table (see HTML_OP_DETAILS). The selected databases' own data is kept as it is; only what lines
     without a database (NONE_DB) logged -- the rows and messages they show up in -- is censored like export()'s
     (the other databases' and the files' names, emails, IPs blanked), with clients, accounts, user and record ids
     pseudonymized too. view: the page's view settings (see viewState() in app.js), whose items are censored the
@@ -1576,7 +1577,8 @@ def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=
     details = {}
     with LOCK:
         for by, rows in (("operation", v["rows"]), ("app", v["groups"]["app"]), ("family", v["groups"]["family"])):
-            names = [r[by] for r in sorted(rows, key=lambda r: -r["total_s"])[:HTML_DETAILS]]
+            top = HTML_OP_DETAILS if by == "operation" else HTML_DETAILS
+            names = [r[by] for r in sorted(rows, key=lambda r: -r["total_s"])[:top]]
             if by == "operation":
                 names += [r["operation"] for r in rows if r["family"] in olp.JOB_KINDS] + (pins or {}).get("ops", [])
             for name in dict.fromkeys(names):

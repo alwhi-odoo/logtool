@@ -10,7 +10,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - **Export HTML**: downloads the page as one standalone, read-only `.html` file of the current selection. Only the
   selected databases are in it (the others are not named), as they are; what lines without a database logged is
   censored (IPs, sessions, logins, emails, user and record ids pseudonymized); the details popup is kept for the top
-  50 rows of each table. With a time interval or a focus, its histogram shows just that span.
+  100 operations, every cron / automation / module-loading operation and the top 50 apps, types and errors. With a time interval or a focus, its histogram shows just that span.
 - **Histogram** tab in the details of an operation, app or type: how many calls took how long (ms, log scale), with
   the average and p95 marked.
 

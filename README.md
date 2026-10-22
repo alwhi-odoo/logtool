@@ -186,8 +186,8 @@ as stable pseudonyms (`ip-3`, `uid-1`, `sale.order(id-4)`).
 It opens read-only: sorting, filtering and grouping the tables, chart items, bucket size and timezone still work;
 picking another database or time interval, focus, item filters, the filter editor and raw log lines do not. With a
 time interval (or a focus) the histogram shows just that span, at the finer bucket sizes of *Focus interval*. The
-details popup is kept for the top 50 rows of each table (operations, apps, types, errors) and for every cron,
-automation and module-loading operation.
+details popup is kept for the top 100 operations, every cron, automation and module-loading operation, and the top
+50 apps, types and errors.
 
 ## Performance
 
