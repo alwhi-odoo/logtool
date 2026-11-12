@@ -32,6 +32,7 @@ A domain is a condition checked against every **occurrence** in the loaded logs.
 | `request` | one HTTP access line (werkzeug / `odoo.http.server`)                         |
 | `job`     | one run of a cron job, an automation rule, or a module loading               |
 | `issue`   | one `WARNING`, `ERROR` or `CRITICAL` log line, with its traceback            |
+| `slow_query` | one query of a PostgreSQL slow-query log (`pg_slow_queries.log`)          |
 
 **Warnings follow the request they were logged during.** When a request is filtered out, the warnings and errors
 its worker logged while it ran go with it, the same way its other lines do. A warning that no request claims
@@ -75,7 +76,7 @@ The same domain, relying on the implicit AND:
 
 ## 3. Fields
 
-### 3.1 Selection fields: `file`, `database`, `time`
+### 3.1 Selection fields: `file`, `database`, `time`, `ip`
 
 These choose which log lines are read at all. **They may only appear as top-level terms joined with AND**,
 never inside `"|"` or `"!"`; the editor rejects that.
@@ -85,12 +86,18 @@ never inside `"|"` or `"!"`; the editor rejects that.
 | `file`     | the name of a loaded log file, as shown in the Files box           | `=`, `!=`, `in`, `not in`                   |
 | `database` | a database name as shown in the Databases box; `false` = the lines with no database | `=`, `!=`, `in`, `not in`      |
 | `time`     | `"YYYY-MM-DD HH:MM:SS"` (seconds optional), in the log's own clock (UTC as logged) | `>=`, `>`, `<`, `<=`         |
+| `ip`       | a client address: the whole report is narrowed to that client      | `=`, `in`                                   |
 
 * `in` / `=` keep only the listed files or databases. `not in` / `!=` leave out the listed ones.
 * Naming a file or database that is not loaded is an error with `in` / `=`. With `not in` / `!=` it is ignored.
 * A domain may not leave out every file, or every database of the selected files.
 * The time interval is from the latest lower bound (`>=` / `>`) to the earliest upper bound (`<` / `<=`).
   Giving only one bound is fine. `["time", "<", "2026-09-02 00:00:00"]` ends just before midnight.
+* `ip` keeps only the requests from the listed addresses and the warnings and errors logged during them. It drops
+  every job (cron jobs, automation rules and module loading have no client), every warning that no request
+  claims and every slow query. Several `ip` terms keep only the addresses they all name.
+  This is not the same as `["client IP", "=", …]`. That field only tests requests, so it leaves jobs and warnings in
+  (section 5).
 
 ### 3.2 Occurrence fields
 
@@ -98,11 +105,12 @@ A term on a field that the occurrence's kind does not have is **not applicable**
 
 | field         | kinds          | type   | meaning                                                                               |
 |---------------|----------------|--------|---------------------------------------------------------------------------------------|
-| `kind`        | all            | text   | `"request"`, `"job"` or `"issue"`                                                     |
+| `kind`        | all            | text   | `"request"`, `"job"`, `"issue"` or `"slow_query"`                                     |
 | `operation`   | request, job   | text   | the operation, exactly as in the operations table (`call_kw sale.order.web_read`, `/shop/<slug>`, `cron: Mail: Email Queue Manager`) |
 | `app`         | request, job   | text   | the app column (`sale`, `stock`, `web`, `base`, …)                                    |
 | `type`        | request, job   | text   | the type column (`ui.read`, `ui.write`, `ui.action`, `api.method`, `assets`, `report`, `cron`, `automation`, `module-load`, …) |
-| `duration`    | request, job   | number | seconds: SQL + Python for a request, the logged duration for a job                    |
+| `duration`    | request, job, slow_query | number | seconds: SQL + Python for a request, the logged duration for a job, how long a slow query ran |
+| `sql`         | slow_query     | text   | the SQL of a slow query, exactly as logged (`["sql", "ilike", "%res_partner%"]`)      |
 | `sql_s`       | request        | number | seconds inside PostgreSQL                                                             |
 | `python_s`    | request        | number | seconds outside PostgreSQL                                                            |
 | `queries`     | request, job   | number | number of SQL queries                                                                 |
@@ -113,6 +121,7 @@ A term on a field that the occurrence's kind does not have is **not applicable**
 | `URL`         | request        | text   | the raw path of the request, with its query string (`/shop/chair-12?page=2`)          |
 | `logged user id` | request, job | text  | user ids named in the lines **logged while it ran** (several possible). See section 3.3 |
 | `logged records` | request, job | text  | records named in the lines logged while it ran, written `model(id)` (several possible). See section 3.3 |
+| `duration ms` | request, job   | text   | a span of `duration` in milliseconds, written `"lo-hi"` (`lo` included, `hi` not) or `"lo-"` (no upper bound): `"100-150"`, `"5000-"`. Takes `=`, `!=`, `in`, `not in`; with several spans, any of them. The *Histogram* tab's bars are such spans |
 | `cron id`     | job            | text   | the cron job's id (`"8"`)                                                             |
 | `status`      | job            | text   | how a cron run ended (`fully done`, `processed`, …)                                   |
 | `remaining`   | job            | text   | how many records a cron run left for later (`"0"`)                                    |
@@ -205,6 +214,10 @@ Consequences:
   `[["Order #", "=", "17"]]` drops the warnings that name no order 17, including those with no `Order #` at all.
 * On a job, `cron id`, `status`, `remaining`, `rule id`, `records processed` and `modules` are applicable even
   when empty.
+* A slow query only has `kind`, `duration` and `sql` (and `file`, `database` and `time`, by when it was logged).
+  `[["duration", ">", 30]]` keeps the requests, jobs and slow queries that took over 30 seconds;
+  `[["kind", "!=", "slow_query"]]` leaves every slow query out. Item filters (section 6) narrow rows of the other
+  tables, so they leave slow queries alone.
 
 ## 6. The app's own filters, as domains
 
@@ -217,9 +230,11 @@ works just as well, but the logs are re-read when it changes (about a second per
 | click a file off in the Files box                 | `["file", "not in", ["other.log"]]` |
 | click a database off                              | `["database", "not in", ["other_db", false]]` |
 | select a time interval (histogram / top bar)      | `["time", ">=", "2026-09-01 08:00:00"], ["time", "<", "2026-09-01 09:00:00"]` |
+| *only this IP* in a client IP table               | `["ip", "in", ["10.0.0.7"]]` |
 | item filter on an operation (click values in its details) | `"\|", ["operation", "!=", "call_kw sale.order.web_read"], ["client IP", "in", ["10.0.0.7", "10.0.0.1"]]` |
 | item filter on an app / type                      | `"\|", ["app", "!=", "sale"], ["session", "in", ["S0012"]]` (a type uses `"type"`) |
 | item filter with two details (AND)                | `"\|", ["operation", "!=", "X"], "&", ["client IP", "in", ["10.0.0.7"]], ["URL", "in", ["/shop/chair-12"]]` |
+| item filter on a span of durations (click a bar of its Histogram tab) | `"\|", ["operation", "!=", "call_kw sale.order.web_read"], ["duration ms", "in", ["100-150"]]` |
 | item filter on what its lines named (Logged during tab) | `"\|", ["operation", "!=", "call_button sale.order.action_confirm"], ["logged records", "in", ["sale.order(42)"]]` |
 | item filter on a warning / error                  | `"\|", ["issue", "!=", ["WARNING", "odoo.addons.sale.models.sale_order", "Order # could not be confirmed by user #"]], ["user #", "in", ["6"]]` |
 | a warning / error traced to its client            | `"\|", ["issue", "!=", ["WARNING", "odoo.http", "From and to dates must be set, and from must be before to."]], ["client IP", "in", ["78.20.216.95"]]` |
@@ -249,13 +264,13 @@ inside `"|"` or `"!"`. Any setting that is left out takes the default shown.
 
 | setting                 | value                                                                                | default |
 |-------------------------|--------------------------------------------------------------------------------------|---------|
-| `chart.item`            | one histogram item: an object with **one** of `"operation"`, `"app"`, `"type"`, `"search"` (free text, matched against type, app and operation) or `"issue"` (`[level, logger, message template]`), plus `"bars"` and `"lines"`: lists of series | no items |
+| `chart.item`            | one histogram item: an object with **one** of `"operation"`, `"app"`, `"type"`, `"search"` (free text, matched against type, app and operation), `"issue"` (`[level, logger, message template]`) or `"slow_query"` (the id of a slow query's shape: the runs of one query, whatever its values), plus `"bars"` and `"lines"`: lists of series | no items |
 | `chart.total`           | `{"bars": [series], "lines": [series]}` for the always-present **total** item          | `{"bars": ["requests"], "lines": ["avg_ms"]}` when there are no items; `{"bars": [], "lines": []}` when there are |
 | `chart.bucket`          | bucket size in minutes: `1`, `2`, `5`, `10`, `15`, `30`, `60`, `120`, `180`, `360`, `720`, `1440`, `10080`, or `"auto"` | `"auto"` |
 | `chart.fit`             | `true`: squeeze every bucket into the panel; `false`: readable bars, horizontal scroll  | `true` |
 | `chart.focus`           | `["chart.focus", ">=", "…"], ["chart.focus", "<", "…"]`: focus mode on that span (both bounds required) | not focused |
 | `chart.timezone`        | an IANA timezone for the histogram's labels: `"UTC"`, `"Europe/Brussels"`, …           | `"UTC"` |
-| `table.group`           | `"operation"`, `"app"` or `"type"`                                                    | `"operation"` |
+| `table.group`           | `"operation"`, `"app"`, `"type"` or `"slow_query"`                                    | `"operation"` |
 | `table.search`          | the text in the table's search box                                                     | `""` |
 | `table.sort`            | `[column, "asc" \| "desc"]`                                                           | `["total_s", "desc"]` |
 | `table.hidden_columns`  | list of hidden columns                                                                 | `["pct_sql_within_op", "pct_python_within_op", "http_5xx", "bottleneck"]` |
@@ -265,8 +280,9 @@ inside `"|"` or `"!"`. Any setting that is left out takes the default shown.
 
 **Series names**, for `bars` and `lines`: `requests`, `avg_ms`, `avg_ms.py`, `avg_ms.sql`, `total_ms`,
 `total_ms.py`, `total_ms.sql`. `avg_ms` is the average ms per request (Python + SQL + jobs); `.py` and `.sql` are
-its parts. `total_ms` is the summed time of the bucket. An `issue` item only has `requests` (its occurrences).
-An item written without `bars` / `lines` gets bars of `requests` and a line of `avg_ms` (an issue: bars only).
+its parts. `total_ms` is the summed time of the bucket. An `issue` item only has `requests` (its occurrences); a
+`slow_query` item has `requests`, `avg_ms` and `total_ms` (its time is not split into Python and SQL). An item
+written without `bars` / `lines` gets bars of `requests` and a line of `avg_ms` (an issue or a slow query: bars only).
 
 **Columns**, for `table.sort` and `table.hidden_columns`: `type`, `app`, `total_s`, `pct_of_total_time`,
 `sql_s`, `pct_sql_within_op`, `python_s`, `pct_python_within_op`, `calls`, `avg_ms`, `p95_s`, `max_s`,
@@ -347,6 +363,12 @@ This drops the other operations too (their `operation` differs), and leaves warn
 operations as they are, use the detail-filter shape:
 `["|", ["operation", "!=", "cron: Mail: Email Queue Manager"], ["status", "!=", "fully done"]]`.
 
+The slow queries over 30 seconds that touch `stock_quant`, and nothing else:
+
+```json
+[["kind", "=", "slow_query"], ["duration", ">", 30], ["sql", "ilike", "%stock_quant%"]]
+```
+
 URLs with a query string, case-insensitively containing "token":
 
 ```json
@@ -402,6 +424,7 @@ log; a `not in` naming something that is not loaded is ignored.
 | `unknown field`                             | use a field of section 3; detail names are case-sensitive (`client IP`, `URL`) |
 | `unknown operator`                          | use an operator of section 4 |
 | `… takes a list of values`                  | the list given to `in` / `not in` holds something other than plain values |
+| `duration ms only takes …`                  | write spans of milliseconds as text, `"100-150"` or `"5000-"`, with `=`, `!=`, `in` or `not in` |
 | `… is a number: … needs a number`           | compare `duration`, `sql_s`, `python_s`, `queries` and `http_status` with numbers |
 | `the domain ends too early`                 | an `"&"` or `"\|"` needs two items after it, `"!"` needs one |
 | `file, database and time can only be top-level conditions` | move them out of `"\|"` / `"!"` |
@@ -411,7 +434,7 @@ log; a `not in` naming something that is not loaded is ignored.
 | `… is a setting: write [...]`               | view settings use `=` (only `chart.focus` takes `>=` / `<`) |
 | `view settings … are top-level terms`       | move `chart.*` / `table.*` / `errors.*` / `panels.*` out of `"\|"` / `"!"` |
 | `chart.item needs exactly one of …`         | give one of `operation`, `app`, `type`, `search`, `issue` |
-| `unknown series`                            | use a series name of section 7 (an issue only has `requests`) |
+| `unknown series`                            | use a series name of section 7 (an issue only has `requests`; a slow query `requests`, `avg_ms` and `total_ms`) |
 | `chart.focus needs a lower (>=) and a higher upper (<) bound` | give both bounds, lower first |
 
 ## 10. For agents: writing a domain

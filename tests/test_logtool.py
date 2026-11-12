@@ -352,6 +352,22 @@ def test_details_count_calls_per_duration(c):
 
 
 @case
+def test_requests_while_a_cron_ran(c):
+    at = lambda t, secs: IMG.replace(b"13:07:00", t) % (b"7", secs)
+    upload(c, "f.log", IMG % (b"7", b"0.1") + at(b"13:08:00", b"0.2") + CRON + at(b"13:08:05", b"10")
+           + at(b"13:09:00", b"0.1"))
+    analyze(c)
+    got = c.get("/api/cron_requests?name=cron:%20Credit%20Check").get_json()
+    assert got["runs"] == 1 and got["requests"] == 2 and got["avg_ms"] == 5110, got   # 0.21 s and 10.01 s overlap it
+    assert sum(b[2] for b in got["durations"]["bins"]) == 2, got
+    got = c.get("/api/cron_requests?name=cron:%20Credit%20Check&ip=10.9.9.9").get_json()
+    assert got["runs"] == 0 and got["requests"] == 0 and got["avg_ms"] is None, got   # an IP filter drops jobs
+    assert c.get("/api/cron_requests?name=image").status_code == 400
+    d = c.get("/api/request_durations").get_json()["durations"]
+    assert sum(b[2] for b in d["bins"]) == 4 and d["bins"][-1][0] <= 10010 < d["bins"][-1][1], d   # the cron is not a request
+
+
+@case
 def test_op_lines_lists_an_operations_own_lines(c):
     upload(c, "f.log", IMG % (b"7", b"0.1") + IMG % (b"8", b"0.3") + IMG % (b"9", b"0.2") + CRON)
     analyze(c)
@@ -478,6 +494,36 @@ def test_fact_filter_keeps_only_matching_requests(c):
 
 
 @case
+def test_a_pinned_warning_outside_the_interval_keeps_the_operations(c):
+    from urllib.parse import quote
+    upload(c, "f.log", FF_LOG)
+    w = analyze(c)[1]["window"]
+    pins = "&pins=" + quote(__import__("json").dumps({"ops": [OP], "issues": [["WARNING", "odoo.models", "Order # is odd"]]}))
+    j = analyze(c, pins + "&from=%d&to=%d" % (w[0], w[0] + 600))[1]          # the warning is logged later
+    assert [r["operation"] for r in j["view"]["rows"]] == [OP], j.get("error") or j["view"]["rows"]
+
+
+@case
+def test_fact_filter_on_a_span_of_durations(c):
+    from urllib.parse import quote
+    upload(c, "f.log", FF_LOG)                                  # calls of 300, 400 and 500 ms
+    upload(c, "g.log", CRON)                                    # a 250 ms cron run
+    calls = lambda q, op=OP: {r["operation"]: r["calls"] for r in analyze(c, q)[1]["view"]["rows"]}.get(op, 0)
+    assert calls(_ff(("operation", OP, {"duration ms": ["300-500"]}))) == 2          # lo included, hi not
+    assert calls(_ff(("operation", OP, {"duration ms": ["0-300", "500-"]}))) == 1     # OR, open-ended
+    d = detail(c, "operation", OP, _ff(("operation", OP, {"duration ms": ["500-"]})))[1]
+    assert d["calls"] == 1 and d["durations"]["unfiltered"] and sum(b[2] for b in d["durations"]["bins"]) == 3, d    # every bar
+    assert calls(_ff(("family", "cron", {"duration ms": ["0-200"]})), "cron: Credit Check") == 0
+    assert calls(_ff(("family", "cron", {"duration ms": ["200-300"]})), "cron: Credit Check") == 1
+    assert c.get("/api/analyze?init=1" + _ff(("operation", OP, {"duration ms": ["slow"]}))).status_code == 400
+    text = '["|", ["operation", "!=", "%s"], ["duration ms", "in", ["300-500"]]]' % OP
+    assert _post_domain(c, text)[1]["state"]["ff"][0]["facts"] == {"duration ms": ["300-500"]}
+    xd = _post_domain(c, '[["duration ms", "not in", ["300-500"]]]')[1]["state"]["xd"]     # a custom condition
+    assert calls("&xd=" + quote(__import__("json").dumps(xd))) == 1
+    assert _post_domain(c, '[["duration ms", ">", "300-500"]]')[0] == 400
+
+
+@case
 def test_fact_filter_on_a_warning_reads_its_traceback(c):
     upload(c, "f.log", FF_LOG)
     key = ["WARNING", "odoo.models", "Order # is odd"]
@@ -560,6 +606,90 @@ def test_a_warning_traces_back_to_its_client(c):
         assert len(c.get("/api/issue_lines?" + q + ff).get_json()) == want, ip
     text = c.get("/api/domain?" + _ff(("issue", key, {"client IP": ["10.0.0.2"]}))[1:]).get_json()["domain"]
     assert _post_domain(c, text)[1]["state"]["ff"][0]["facts"] == {"client IP": ["10.0.0.2"]}, text
+
+
+@case
+def test_one_client_ip_narrows_the_whole_report(c):
+    from urllib.parse import quote
+    upload(c, "l.log", LOGGED_LOG + CRON + b"2026-09-14 13:09:00,000 1 WARNING mydb odoo.modules: Startup thing\n")
+    j = analyze(c)[1]
+    assert {r["operation"] for r in j["view"]["rows"]} == {CONFIRM, "cron: Credit Check"} and len(j["view"]["issues"]) == 2
+    for ip, calls, issues in (("10.0.0.2", 1, ["Access denied (id=#)"]), ("10.0.0.1", 1, []), ("10.9.9.9", 0, [])):
+        j = analyze(c, "&ip=" + ip)[1]      # its requests and what was logged during them: no cron, no unclaimed warning
+        assert {r["operation"]: r["calls"] for r in j["view"]["rows"]} == ({CONFIRM: calls} if calls else {}), (ip, j["view"]["rows"])
+        assert [i["message"] for i in j["view"]["issues"]] == issues, ip
+        q = "level=WARNING&logger=odoo.models&msg=" + quote("Access denied (id=#)") + "&ip=" + ip
+        assert len(c.get("/api/issue_lines?" + q).get_json()) == len(issues), ip
+    assert len(c.get("/api/op_lines?by=operation&name=%s&ip=10.0.0.3" % quote(CONFIRM)).get_json()) == 1
+    assert c.get("/api/op_lines?by=operation&name=%s&ip=10.0.0.3" % quote("cron: Credit Check")).get_json() == []
+    text = c.get("/api/domain?ip=10.0.0.2").get_json()["domain"]
+    assert '["ip", "in", ["10.0.0.2"]]' in text, text
+    assert _post_domain(c, text)[1]["state"]["ip"] == ["10.0.0.2"]
+    assert _post_domain(c, '[["ip", "=", "10.0.0.2"], ["ip", "in", ["10.0.0.1", "10.0.0.2"]]]')[1]["state"]["ip"] == ["10.0.0.2"]
+    assert _post_domain(c, '[["ip", "=", "10.0.0.2"], ["ip", "=", "10.0.0.1"]]')[0] == 400
+    assert _post_domain(c, '[["ip", "!=", "10.0.0.2"]]')[0] == 400
+    assert _post_domain(c, '["|", ["ip", "=", "10.0.0.2"], ["kind", "=", "job"]]')[0] == 400
+
+
+@case
+def test_one_client_ip_keeps_only_its_logins_and_held_connections(c):
+    ws = (b'2026-09-14 13:05:30,000 4300 INFO mydb werkzeug: 10.0.0.1 - - [14/Sep/2026 13:05:30] '
+          b'"GET /websocket HTTP/1.1" 101 - 2 0.01 300.0\n')
+    upload(c, "a.log", LOGIN + AUTH + ws + AUTH.replace(b"10.0.0.1", b"10.0.0.2").replace(b"13:05:07,100", b"13:05:40,000"))
+    assert analyze(c)[1]["view"]["stats"]["held_n"] == 1
+    j = analyze(c, "&ip=10.0.0.2")[1]
+    assert j["view"]["stats"]["held_n"] == 0 and j["view"]["stats"]["held_s"] == 0, j["view"]["stats"]      # the other client's WebSocket
+    e = __import__("json").loads(c.get("/api/export?ip=10.0.0.2").get_data())   # jane logged in from 10.0.0.1, not from it
+    assert [l["result"] for l in e["logins"]] == ["?"] and all(not cl["logins"] for cl in e["clients"]), (e["logins"], e["clients"])
+
+
+@case
+def test_export_text_holds_one_database_and_every_occurrence_in_time_order(c):
+    import re
+    other = (b'2026-09-14 13:05:30,000 77 INFO otherdb werkzeug: 10.9.9.9 - - [14/Sep/2026 13:05:30] '
+             b'"GET /web HTTP/1.1" 200 - 1 0.01 0.01\n')
+    nodb = b"2026-09-14 13:05:40,000 1 INFO ? odoo.service.server: HTTP service running\n"
+    upload(c, "a.log", RPC % b"0.2" + other + nodb + RPC.replace(b"10.0.0.1", b"10.0.0.2").replace(b"13:05:09", b"13:06:09") % b"0.3")
+    upload(c, "b.log", CRON + RPC.replace(b"10.0.0.1", b"10.0.0.3").replace(b"13:05:09", b"13:04:00") % b"0.1")
+    analyze(c)
+    r = c.get("/api/export_text")                                   # two databases: refused
+    assert r.status_code == 400 and "select only one" in r.get_json()["error"], r.get_json()
+    r = c.get("/api/export_text?exclude_db=otherdb")
+    text = r.get_data(as_text=True)
+    assert r.status_code == 200 and r.mimetype == "text/plain" and ".txt" in r.headers["Content-Disposition"]
+    assert "otherdb" not in text and "10.9.9.9" not in text, text  # the other database's lines: not even as context
+    hist, table, raw = text.split("=" * 100)
+    assert hist.startswith("REQUESTS OVER TIME") and "#" in hist and table.strip().startswith("OPERATIONS (2,")
+    assert re.search(r"\n%s +3 +300\n" % re.escape(OP), table), table       # name, calls, avg ms
+    assert "client IP" not in table and "10.0.0.2" not in table and "cron id" in table, table   # its details, but its clients
+    heads = re.findall(r"\n\[\d+\] (\S+ \S+)  (.+?)  \(", raw)
+    assert [h[0][11:] for h in heads] == ["13:04:00", "13:05:09", "13:06:09", "13:08:00"], heads   # both files, oldest first
+    assert raw.count("\n> ") == 4 and "RAW LOG LINES (4 occurrences" in raw
+    first = raw.split("\n\n\n")[2]                                     # 13:05:09: nothing above it, its file's next line below
+    assert [l[:1] for l in first.splitlines()[1:]] == [">", " "], first
+    assert " ? " not in raw and "HTTP service running" not in raw, raw     # no line without a database
+    one = c.get("/api/export_text?exclude_db=otherdb&ip=10.0.0.2").get_data(as_text=True)   # the filters scope it
+    assert "RAW LOG LINES (1 occurrence," in one and re.findall(r"\n> .*?(10\.0\.0\.\d)", one) == ["10.0.0.2"], one
+    assert "OPERATIONS (1," in one
+
+
+@case
+def test_export_html_carries_no_filter_values(c):
+    import json
+    import re
+    from urllib.parse import quote
+    upload(c, "l.log", LOGGED_LOG)
+    analyze(c)
+    ff = _ff(("operation", CONFIRM, {"URL": ["SECRET_FF"]}), ("issue", ["WARNING", "odoo.models", "Access denied (id=#)"], {"user id": ["SECRET_FF2"]}))
+    view = {"items": [], "table": {"group": "operation", "search": "SECRET_TS"}, "errors": {"level": "all", "search": "SECRET_ES"}}
+    q = ("/api/export_html?ip=10.0.0.2&xd=" + quote(json.dumps([["URL", "not like", "SECRET_XD"]])) + ff +
+         "&desc=SECRET_DESC&view=" + quote(json.dumps(view)))
+    r = c.get(q)
+    page = r.get_data(as_text=True)
+    assert r.status_code == 200 and "SECRET" not in page, re.findall(r"SECRET_\w+", page)
+    snap = json.loads(re.search(r'id="snapshot">(.*?)</script>', page, re.S).group(1))
+    assert snap["filter"] == "2 item filters · 1 custom condition · only 1 client IP", snap["filter"]
+    assert snap["view"]["table"] == {"group": "operation", "search": ""} and snap["view"]["errors"]["search"] == ""
 
 
 @case
@@ -646,7 +776,7 @@ def test_domain_round_trips_the_apps_filters(c):
     assert OP not in {r["operation"] for r in j["view"]["rows"]}
     empty = _post_domain(c, "[]")[1]["state"]
     assert {k: v for k, v in empty.items() if k != "view"} == {"exclude_file": [], "exclude_db": [], "interval": None,
-                                                              "ff": [], "xd": None}
+                                                              "ip": [], "ff": [], "xd": None}
     assert empty["view"]["total"] == {"bars": ["requests"], "lines": ["avg_ms"]} and empty["view"]["bucket"] == "auto"
 
 
@@ -1222,6 +1352,116 @@ def test_stopping_the_server_with_sigterm_stops_its_workers(c):
     finally:
         if p.poll() is None:
             p.kill()
+
+
+# --------------------------------------------------------------------------- #
+# PostgreSQL slow-query logs: their own parser, table, form, chart items, "logged during" and exports
+# --------------------------------------------------------------------------- #
+
+SQ_RULE = b"-" * 80 + b"\n"
+SQ = (SQ_RULE + b"2026-09-14 13:05:20.500 UTC mydb: approximate duration: 15 seconds\n\n"
+      b"SELECT id FROM res_partner WHERE name ilike '%o''brien%'  -- a 'comment'\n  AND id IN (1, 2, 3)\n\n" +
+      SQ_RULE + b"2026-09-14 13:20:00.000 UTC mydb: approximate duration: 41 seconds\n\n"
+      b"SELECT id FROM res_partner WHERE name ilike '%acme%'\n  AND id IN (7)\n\n" +
+      SQ_RULE + b"2026-09-14 13:21:00.000 UTC other_db: approximate duration: 3 seconds\n\n"
+      b"UPDATE stock_quant SET quantity = 5 WHERE id = 9\n")
+
+
+def _sq_file(data=SQ, name="pg.log"):
+    path = os.path.join(A._upload_dir(), "sq-" + name)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return path
+
+
+@case
+def test_slow_query_parser_groups_runs_by_shape(c):
+    qs, shapes = olp.sq_parse(_sq_file())
+    assert [(q.db, q.seconds, q.cut) for q in qs] == [("mydb", 15.0, False), ("mydb", 41.0, False), ("other_db", 3.0, False)]
+    assert qs[0].end == olp.stamp_minute("2026-09-14", "13:05") * 60 + 20.5 and "\n  AND id IN (1, 2, 3)" in qs[0].sql
+    assert qs[0].shape == qs[1].shape != qs[2].shape, qs                        # other values, same query
+    assert shapes[qs[0].shape] == "SELECT id FROM res_partner WHERE name ilike ? AND id IN (?)", shapes
+    assert "brien" not in olp.sq_censor(qs[0].sql) and "comment" not in olp.sq_censor(qs[0].sql)
+    assert [q.db for q in olp.sq_parse(_sq_file(), only_db="other_db")[0]] == ["other_db"]
+    big = olp.sq_parse(_sq_file(SQ_RULE + b"2026-09-14 13:00:00 UTC : approximate duration: 2 seconds\n\nSELECT " +
+                                b"x, " * 60000 + b"y\n"))[0]
+    assert big[0].cut and len(big[0].sql) <= olp.SQ_SQL_MAX + 1 and big[0].db is None, (big[0].cut, len(big[0].sql))
+    assert olp.sq_sniff(_sq_file(name="anything.log")) and not olp.sq_sniff(SAMPLE)    # by content, or by name
+    assert olp.sq_sniff(SAMPLE, "pg_slow_queries.log.gz")
+    odd = olp.sq_parse(_sq_file(SQ_RULE + b"2026-02-31 10:00:00 UTC db: approximate duration: 3 seconds\n\nSELECT 1\n" +
+                                SQ_RULE + b"2026-02-10 25:99:00 UTC db: approximate duration: 3 seconds\n\nSELECT 2\n" + SQ))[0]
+    assert len(odd) == 3 and "SELECT 1" not in odd[0].sql and "SELECT 2" not in odd[0].sql, odd   # impossible stamps: skipped
+
+
+@case
+def test_slow_queries_alone_and_beside_a_log(c):
+    up = upload(c, "pg_slow_queries.log", SQ).get_json()
+    s, j = analyze(c)
+    assert j["files"][0]["kind"] == "slowq" and not j["files"][0]["problem"], j["files"]       # known once parsed
+    assert s == 200 and j["databases"] == [["mydb", 2], ["other_db", 1]] and j["excluded_db"] == ["other_db"], j
+    sq = j["slowq"]
+    assert sq["n"] == 2 and sq["max_s"] == 41 and sq["shapes"] == 1 and len(sq["rows"]) == 1, sq     # one row per shape
+    r = sq["rows"][0]
+    assert (r["n"], r["total_s"], r["avg_s"], r["max_s"], r["dbs"]) == (2, 56, 28, 41, ["mydb"]), r
+    assert [s_ for _, s_ in r["runs"]] == [15, 41] and r["head"] == "SELECT id FROM res_partner WHERE name ilike ? AND id IN (?)", r
+    assert sq["labels"][r["shape"]] == r["head"]
+    assert j["window"] and j["view"]["stats"]["window"][0] == "2026-09-14T13:05:20", j["view"]["stats"]   # their own span
+    s, j = analyze(c, "&from=%d&to=%d" % (j["window"][0], j["window"][0] + 600))
+    assert s == 200 and j["slowq"]["n"] == 1, j.get("error")                   # logged in the interval
+    upload(c, "odoo.log", FF_LOG)
+    j = analyze(c)[1]
+    assert j["slowq"]["n"] == 2 and j["databases"][0] == ["mydb", 7], j["databases"]
+    assert c.get("/api/analyze?exclude_db=mydb&exclude_db=-").get_json()["slowq"]["n"] == 1   # follows the databases box
+    assert c.get("/api/analyze?init=1&exclude_file=" + up[0]["id"]).get_json()["slowq"]["n"] == 0
+
+
+@case
+def test_slow_query_form_and_what_ran_meanwhile(c):
+    upload(c, "f.log", FF_LOG)
+    upload(c, "pg_slow_queries.log", SQ)
+    shape = analyze(c)[1]["slowq"]["rows"][0]
+    d = c.get("/api/slowq?id=" + shape["id"]).get_json()                     # a shape's row opens its longest run
+    assert d["s"] == 41 and d["db"] == "mydb" and d["same"]["n"] == 2 and d["same"]["total_s"] == 56, d
+    assert sum(b[2] for b in d["same"]["durations"]["bins"]) == 2 and [x["s"] for x in d["same"]["items"]] == [15, 41], d["same"]
+    row = d["same"]["items"][0]
+    assert "o''brien" in c.get("/api/slowq?id=" + row["id"]).get_json()["sql"]
+    rn = c.get("/api/slowq?running=1&id=" + row["id"]).get_json()          # 13:05:05.5 - 13:05:20.5: the two 13:05:09 calls
+    assert rn["n"] == 2 and {o["operation"] for o in rn["items"]} == {OP}, rn
+    sd = c.get("/api/op_slowq?by=operation&name=" + OP.replace(" ", "%20")).get_json()
+    it = sd["items"][0]                                                          # one item per shape
+    assert (sd["n"], sd["runs"], it["id"], it["n"], it["calls"], it["dbs"]) == (1, 1, row["id"], 1, 2, ["mydb"]), sd
+    assert it["head"] == "SELECT id FROM res_partner WHERE name ilike ? AND id IN (?)", it
+    assert c.get("/api/op_slowq?by=app&name=stock").get_json()["n"] == 1
+    assert c.get("/api/slowq?id=nope:1").status_code == 400 and c.get("/api/op_slowq?by=x&name=y").status_code == 400
+
+
+@case
+def test_slow_queries_in_the_domain_and_the_exports(c):
+    from urllib.parse import quote
+    import json
+    upload(c, "f.log", FF_LOG)
+    upload(c, "pg_slow_queries.log", SQ)
+    analyze(c)
+
+    def n(text):
+        st = _post_domain(c, text)[1]["state"]
+        q = ("&xd=" + quote(json.dumps(st["xd"])) if st["xd"] else "") + "".join("&ip=" + ip for ip in st["ip"])
+        return analyze(c, q)[1]["slowq"]["n"]
+    assert n('[["kind", "=", "slow_query"], ["duration", ">", 20]]') == 1
+    assert n('[["sql", "ilike", "%brien%"]]') == 1 and n('[["kind", "=", "request"]]') == 0 and n('[["http_status", ">=", 500]]') == 2
+    assert n('[["ip", "=", "10.0.0.1"]]') == 0                                  # a slow query has no client
+    st = _post_domain(c, '[["chart.item", "=", {"slow_query": "abc", "lines": ["total_ms"]}], ["table.group", "=", "slow_query"]]')[1]
+    assert st["state"]["view"]["items"] == [{"slow_query": "abc", "bars": ["requests"], "lines": ["total_ms"]}], st
+    assert st["state"]["view"]["table"]["group"] == "slow_query"
+    assert "a slow query only has" in _post_domain(c, '[["chart.item", "=", {"slow_query": "abc", "bars": ["avg_ms.py"]}]]')[1]["error"]
+    ex = c.get("/api/export?exclude_db=other_db").get_data(as_text=True)
+    sq = json.loads(ex)["slow_queries"]
+    assert sq["n"] == 2 and sq["by_shape"][0]["n"] == 2 and "res_partner" not in ex and "mydb" not in ex, sq
+    txt = c.get("/api/export_text?exclude_db=other_db").get_data(as_text=True)
+    assert "SLOW QUERIES (2 runs of 1 shapes," in txt and "res_partner" not in txt.split("SLOW QUERIES")[1].split("RAW LOG LINES")[0]
+    view = {"items": [], "total": {"bars": [], "lines": []}, "table": {"group": "slow_query"}, "errors": {}}
+    html = c.get("/api/export_html?exclude_db=other_db&view=" + quote(json.dumps(view))).get_data(as_text=True)
+    assert "brien" not in html and "acme" not in html and "ilike ?" in html, html[:300]
 
 # pytest runs the same cases: `pytest tests/` (each case gets a freshly reset app as `c`)
 try:

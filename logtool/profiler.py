@@ -52,9 +52,12 @@ import bz2
 import contextlib
 import csv
 import datetime
+import functools
 import gzip
+import hashlib
 import heapq
 import json
+import math
 import multiprocessing
 import os
 import random
@@ -206,25 +209,46 @@ def merge_facts(into, facts):
 # when, for every detail in `want`, it carries one of the values (OR within a detail, AND across details).
 # A warning's client IP and session come from the request that later claims it, so a warning filtered by them
 # waits in the worker's pending list until that request ends (see Profile._claim); one no request claims has
-# no client and is left out.
+# no client and is left out. args.fact_filter["client"] = {"client IP": frozenset(ips)} narrows the whole report
+# to those clients (the domain's "ip"): their requests and every warning logged during them, nothing else.
 # what the lines logged while a request / job ran name (users, records), told apart from its own details
 F_LOGGED_USER, F_LOGGED_REC = "logged user id", "logged records"
 LOGGED_OF = ((F_USER, F_LOGGED_USER), (F_REC, F_LOGGED_REC))
-ISSUE_UNFILTERABLE = (F_LOGGED_USER, F_LOGGED_REC)    # a warning has no lines of its own
+# how long a request / job took, picked as ranges of milliseconds "lo-hi" (lo included, hi not; "lo-": no upper
+# bound), the duration histogram's bins; `have` holds its seconds rather than a set of values
+F_DUR = "duration ms"
+ISSUE_UNFILTERABLE = (F_LOGGED_USER, F_LOGGED_REC, F_DUR)    # a warning has no lines of its own, nor a duration
 CLIENT_FACTS = (F_IP, F_SESSION)    # a warning's client: only known once the request that logged it ends
+
+
+@functools.lru_cache(maxsize=256)
+def dur_range(v):
+    """A F_DUR value "lo-hi" (ms) -> (lo, hi) in seconds, hi inf for "lo-"; None when it is not one."""
+    lo, sep, hi = v.partition("-")
+    try:
+        lo, hi = float(lo) / 1000, float(hi) / 1000 if hi.strip() else math.inf
+    except ValueError:
+        return None
+    return (lo, hi) if sep and 0 <= lo < hi else None
 
 
 def _facts_ok(want, have):
     """Does one occurrence, carrying facts `have` ({detail: iterable of values}), satisfy filter `want`?"""
     for slot, vals in want.items():
         got = have.get(slot)
-        if not got or vals.isdisjoint(got):
+        if slot == F_DUR:
+            if got is None or not any(lo <= got < hi for lo, hi in map(dur_range, vals)):
+                return False
+        elif not got or vals.isdisjoint(got):
             return False
     return True
 
 
 def _op_filter_ok(ff, fam, app, det, have):
-    """Does one request / job of operation `det` pass every fact filter aimed at it, its app or its type?"""
+    """Does one request / job of operation `det` pass every fact filter aimed at it, its app or its type, and
+    the report's client (a job has none)?"""
+    if ff.get("client") and not _facts_ok(ff["client"], have):
+        return False
     for by, name in (("operation", det), ("app", app), ("family", fam)):
         want = ff.get(by, {}).get(name)
         if want and not _facts_ok(want, have):
@@ -232,10 +256,20 @@ def _op_filter_ok(ff, fam, app, det, have):
     return True
 
 
-def request_facts(ip, session, path, collapsed):
+def _client_want(ff, want):
+    """What the client of a warning with item filter `want` must be: that filter's client IP / session, and
+    the report's client (ff["client"])."""
+    client = dict(ff.get("client") or {})
+    for k, v in want.items():
+        if k in CLIENT_FACTS:
+            client[k] = client[k] & v if k in client else v
+    return client
+
+
+def request_facts(ip, session, path, collapsed, seconds):
     """The facts one access line carries ({detail: set of values}), for item filters. The URL is always there
     (a domain's URL is the raw path of every request); only the details shown keep it for collapsed paths."""
-    have = {F_IP: {ip}, F_URL: {path[:FACT_LEN]}}
+    have = {F_IP: {ip}, F_URL: {path[:FACT_LEN]}, F_DUR: seconds}
     if session != "-":
         have[F_SESSION] = {session}
     return have
@@ -1308,7 +1342,7 @@ class Profile:
         self._ihold = None
         tpl = _norm_head(msg)
         want = self.a.fact_filter.get("issue", {}).get((level, logger, tpl)) or {}
-        client = {k: v for k, v in want.items() if k in CLIENT_FACTS}
+        client = _client_want(self.a.fact_filter, want)
         own = {k: v for k, v in want.items() if k not in CLIENT_FACTS}
         xp = extra_pred(self.a)
         have = issue_occurrence_facts(msg, more)
@@ -1466,7 +1500,7 @@ class Profile:
         ff = getattr(self.a, "fact_filter", None)
         logged = self._logged_facts(pid, t_end, seconds, pend, lpend) if fam == "cron" else {}
         if ff:
-            have = dict(logged)
+            have = dict(logged, **{F_DUR: seconds})
             for slot, v in facts:
                 have.setdefault(slot, set()).add(v)
             xp = extra_pred(self.a)
@@ -1545,13 +1579,12 @@ class Profile:
             self.filtered += 1
             return
         span = qt + ot                                      # how long the request ran, before any held time is removed
+        held = None
         if status == "101" or path.startswith("/longpolling/poll"):
             # A WebSocket upgrade / long poll keeps the connection open for minutes and Odoo books that
             # whole wall-clock time as "other time". It is waiting, not working: keep the SQL part
-            # (the handshake's real queries) and report the held time separately.
-            self.held_n += 1
-            self.held_s += ot
-            ot = 0.0
+            # (the handshake's real queries) and report the held time separately (once the filters keep it).
+            held, ot = ot, 0.0
         key = (method, path, status == "404")
         cls = _REQ_CACHE.get(key)
         if cls is None:
@@ -1567,11 +1600,15 @@ class Profile:
         logged = self._logged_facts(pid, t_end, span, pend, lpend) if t_end else {}
         if ff:
             xp = extra_pred(self.a)
-            if not _op_filter_ok(ff, fam, app, det, dict(request_facts(ip, session, path, collapsed), **logged)) or \
+            if not _op_filter_ok(ff, fam, app, det, dict(request_facts(ip, session, path, collapsed, qt + ot), **logged)) or \
                     (xp and not xp(request_fields(fam, app, det, status, method, qt, ot, nq, ip, session, path, logged))):
                 self.filtered += 1
                 self._drop_claims(pid, pend, lpend, t_end, span)
+                self._pending_login.pop(pid, None)          # its login line goes with it, not to the worker's next login
                 return
+        if held is not None:
+            self.held_n += 1
+            self.held_s += held
         f = self.op_facts.get(det)
         if f is None:
             f = self.op_facts[det] = {}
@@ -1815,6 +1852,7 @@ class Profile:
                     "pct_python_within_op": round(100 * b.py / (b.total or 1e-9), 2),
                     "unsplit_s": round(b.unsplit, 3),
                     "avg_ms": round(1000 * b.total / b.n, 2) if b.n else 0,
+                    "p50_s": round(b.pct(50), 3),
                     "p95_s": round(b.pct(95), 3),
                     "max_s": round(b.mx, 3),
                     "queries": b.nq,
@@ -1895,7 +1933,7 @@ def scan_issue_occurrences(path, level, logger, template, exclude_db, lo, hi, li
     ff = ff or {}
     xp = dom_compile(ff["extra"]) if ff.get("extra") else None
     want = ff.get("issue", {}).get((level, logger, template)) or {}
-    client = {k: v for k, v in want.items() if k in CLIENT_FACTS}
+    client = _client_want(ff, want)
     own = {k: v for k, v in want.items() if k not in CLIENT_FACTS}
     track = bool(ff)
 
@@ -2035,11 +2073,11 @@ def _line_operation(logger, msg):
         collapsed = "?" in path or _DIGITS.search(path) or "<" in det or "…" in det or "/*" in det
         fields = request_fields(fam, app, det, status, method, qt, ot, int(m.group("nq") or 0), m.group("ip"), m.group("ident"), path)
         return (fam, app, det, qt + ot if m.group("qt") else None,
-                request_facts(m.group("ip"), m.group("ident"), path, collapsed), fields)
+                request_facts(m.group("ip"), m.group("ident"), path, collapsed, qt + ot), fields)
     if logger.endswith(JOB_LOGGERS):
         job = classify_job(logger, msg)
         if job:
-            have = {}
+            have = {F_DUR: job[3]}
             for slot, v in job[6]:
                 have.setdefault(slot, set()).add(v)
             return job[0], job[1], job[2], job[3], have, job_fields(job[0], job[1], job[2], job[3], job[4], job[6])
@@ -2055,8 +2093,8 @@ _TIMING_TAIL = re.compile(r'" \d{3} \S+ \d+ ([\d.]+) ([\d.]+)')       # an acces
 
 def scan_op_occurrences(path, by, name, exclude_db, lo, hi, limit, slowest=False, ff=None, piece=None, min_seconds=None,
                         only_db=None):
-    """The timed lines in `path` of one operation, app or type (`by` is "operation", "app" or "family"), as
-    [{"line", "stamp", "seconds"}]: the first `limit` in file order, or with `slowest` the `limit` slowest
+    """The timed lines in `path` of one operation, app or type (`by` is "operation", "app" or "family"; `name`
+    None: of every one), as [{"line", "stamp", "seconds"}]: the first `limit` in file order, or with `slowest` the `limit` slowest
     (which reads the whole file). `exclude_db` and `lo`/`hi` narrow it like scan_issue_occurrences, and
     `ff` (args.fact_filter's shape) leaves out the lines the fact filters leave out of the counts. min_seconds:
     with `slowest`, lines that took less are passed over on a cheap look at their timing, before any parsing
@@ -2131,7 +2169,7 @@ def scan_op_occurrences(path, by, name, exclude_db, lo, hi, limit, slowest=False
                                     if facts.get(mine):
                                         logged.setdefault(nm, set()).update(v for v in facts[mine] if v != FACT_OTHER)
                         lst.clear()
-                if op is None or op[col] != name:
+                if op is None or (name is not None and op[col] != name):
                     continue
                 if ff and (not _op_filter_ok(ff, op[0], op[1], op[2], dict(op[4], **logged)) or
                            (xp and not xp(dict(op[5], **logged)))):
@@ -2143,8 +2181,8 @@ def scan_op_occurrences(path, by, name, exclude_db, lo, hi, limit, slowest=False
                         continue
                     if secs < lo or secs >= hi:
                         continue
-                occ = {"line": i, "stamp": "%sT%s" % (date, tm), "seconds": op[3],
-                       "operation": op[2] if by != "operation" else None}
+                occ = {"line": i, "stamp": "%sT%s" % (date, tm), "seconds": op[3], "family": op[0],
+                       "operation": op[2] if by != "operation" or name is None else None, "db": db}
                 if not slowest:
                     out.append(occ)
                     continue
@@ -2157,6 +2195,34 @@ def scan_op_occurrences(path, by, name, exclude_db, lo, hi, limit, slowest=False
     except OSError:
         pass
     return out if not slowest else [e[3] for e in sorted(heap, reverse=True)]
+
+
+def occurrence_context(path, lines, dbs, around):
+    """{line number: [(line number, line), ...]}: each of `lines` (line numbers in `path`) with the `around` lines
+    before and after it, counting only the entries (header and continuation lines) of databases `dbs` -- the other
+    databases' lines are skipped, never shown."""
+    want, out, before, after = set(lines), {}, deque(maxlen=around), []
+    skip = True                                  # continuation lines before the first header: no database known
+    with _numbered_lines(path) as numbered:
+        for i, raw in numbered:
+            g = _parse_header_g(raw)
+            if g is not None:
+                skip = _db_of(g) not in dbs
+            if skip:
+                continue
+            line = (i, ANSI.sub("", raw).rstrip("\r\n"))
+            for e in after:
+                e[0].append(line)
+                e[1] -= 1
+            after = [e for e in after if e[1] > 0]
+            if i in want:
+                out[i] = list(before) + [line]
+                if around:
+                    after.append([out[i], around])
+            before.append(line)
+            if not after and len(out) == len(want):
+                break
+    return out
 
 
 def mark_context(lines, match_at, by=None, name=None, issue=None):
@@ -2264,14 +2330,15 @@ DOM_SELECTION = {
     "file": "name of a loaded log file",
     "database": "database name of the log line (false: lines with no database)",
     "time": "timestamp of the log line, 'YYYY-MM-DD HH:MM:SS' in the log's own clock (UTC)",
+    "ip": "the whole report narrowed to these client addresses: their requests and the warnings logged during them",
 }
 # what each kind of occurrence carries: field -> (kinds, meaning)
 DOM_FIELDS = {
-    "kind": ("all", "'request', 'job' or 'issue' (a WARNING / ERROR / CRITICAL line)"),
+    "kind": ("all", "'request', 'job', 'issue' (a WARNING / ERROR / CRITICAL line) or 'slow_query'"),
     "operation": ("request, job", "the operation, as in the table's operation column"),
     "app": ("request, job", "the Odoo app that owns the operation"),
     "type": ("request, job", "the kind of work (ui.read, api.write, cron, ...), the table's type column"),
-    "duration": ("request, job", "seconds the request / job took (SQL + Python)"),
+    "duration": ("request, job, slow_query", "seconds the request / job took (SQL + Python), or the slow query ran"),
     "sql_s": ("request", "seconds in PostgreSQL"),
     "python_s": ("request", "seconds outside PostgreSQL"),
     "queries": ("request, job", "number of SQL queries"),
@@ -2295,9 +2362,12 @@ DOM_FIELDS = {
     F_LOGGED_REC: ("request, job", "records named in the lines logged while it ran, like sale.order(42)"),
     F_USER: ("issue", "user ids named in the message or its traceback"),
     F_REC: ("issue", "records named in the message or its traceback, like sale.order(12)"),
+    "sql": ("slow_query", "the SQL of a slow query (from a PostgreSQL slow-query log), as logged"),
+    F_DUR: ("request, job", "duration ranges in ms, \"lo-hi\" (lo included, hi not; \"lo-\": no upper bound), "
+                            "as the duration histogram's bars"),
 }
 DOM_DETAILS = (F_IP, F_SESSION, F_URL, F_USER, F_REC, "cron id", "status", "remaining", "rule id", "records processed",
-               "modules", F_LOGGED_USER, F_LOGGED_REC)
+               "modules", F_LOGGED_USER, F_LOGGED_REC, F_DUR)
 # 'Order #', 'ID # (2)': the numbers behind a template's '#'; a bare '#' / '# (2)' when no word precedes the number
 DOM_NUMBER_FIELD = re.compile(r"^(?:\S.* )?#(?: \(\d+\))?$")
 DOM_NUMERIC = {"duration", "sql_s", "python_s", "queries", "http_status"}     # compared as numbers only
@@ -2344,13 +2414,13 @@ def dom_is_field(name):
 # filter editor always writes all of them; a domain that leaves one out gets its default.
 DOM_VIEW = {
     "chart.item": "one histogram item: {kind: name, \"bars\": [series], \"lines\": [series]}, kind being operation, "
-                  "app, type, search (free text) or issue ([level, logger, message template])",
+                  "app, type, search (free text), issue ([level, logger, message template]) or slow_query (a shape id)",
     "chart.total": "the series of the \"total\" item: {\"bars\": [series], \"lines\": [series]}",
     "chart.bucket": "bucket size in minutes (1, 2, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440, 10080) or \"auto\"",
     "chart.fit": "true: squeeze every bucket into the panel width; false: keep bars readable and scroll",
     "chart.focus": "the span the chart is focused on, two bounds like time (>= and <)",
     "chart.timezone": "timezone of the histogram's labels, like \"UTC\" or \"Europe/Brussels\"",
-    "table.group": "rows of the table: operation, app or type",
+    "table.group": "rows of the table: operation, app, type or slow_query",
     "table.search": "text typed in the table's search box",
     "table.sort": "[column, \"asc\" | \"desc\"]",
     "table.hidden_columns": "list of the table columns that are hidden",
@@ -2359,7 +2429,8 @@ DOM_VIEW = {
     "panels.hidden": "list of the panels that are collapsed: chart, table, selected, errors",
 }
 DOM_SERIES = ("requests", "avg_ms", "avg_ms.py", "avg_ms.sql", "total_ms", "total_ms.py", "total_ms.sql")
-DOM_ITEM_KINDS = ("operation", "app", "type", "search", "issue")
+DOM_ITEM_KINDS = ("operation", "app", "type", "search", "issue", "slow_query")
+DOM_ITEM_SERIES = {"issue": ("requests",), "slow_query": ("requests", "avg_ms", "total_ms")}   # what those kinds can plot
 DOM_BUCKETS = (1, 2, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440, 10080)
 DOM_COLUMNS = ("type", "app", "total_s", "pct_of_total_time", "sql_s", "pct_sql_within_op", "python_s",
                "pct_python_within_op", "calls", "avg_ms", "p95_s", "max_s", "queries_per_call", "ms_sql_per_query",
@@ -2373,13 +2444,15 @@ DOM_VIEW_DEFAULT = {
 }
 
 
-def _dom_series(v, where, what, issue=False):
+def _dom_series(v, where, what, kind=None):
     if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
         raise DomainError("%s is a list of series names, in %s" % (what, where))
-    bad = [x for x in v if x not in DOM_SERIES or (issue and x != "requests")]
+    only = DOM_ITEM_SERIES.get(kind, DOM_SERIES)
+    bad = [x for x in v if x not in only]
     if bad:
         raise DomainError("unknown series %s in %s; %s" % (", ".join(json.dumps(x) for x in bad), where,
-                          "an issue only has \"requests\" (its occurrences)" if issue else "use " + ", ".join(DOM_SERIES)))
+                          "an issue only has \"requests\" (its occurrences)" if kind == "issue" else
+                          "a slow query only has " + ", ".join(only) if kind == "slow_query" else "use " + ", ".join(DOM_SERIES)))
     return list(dict.fromkeys(v))
 
 
@@ -2407,8 +2480,8 @@ def _dom_view_term(field, op, value, where):
         if not issue and (not isinstance(name, str) or not name.strip()):
             raise DomainError("the %s of a chart.item is a non-empty text, in %s" % (kind, where))
         out = {kind: name,
-               "bars": _dom_series(value.get("bars", ["requests"]), where, "bars", issue),
-               "lines": _dom_series(value.get("lines", [] if issue else ["avg_ms"]), where, "lines", issue)}
+               "bars": _dom_series(value.get("bars", ["requests"]), where, "bars", kind),
+               "lines": _dom_series(value.get("lines", [] if kind in DOM_ITEM_SERIES else ["avg_ms"]), where, "lines", kind)}
         return out
     if field == "chart.total":
         if not isinstance(value, dict) or set(value) - {"bars", "lines"}:
@@ -2427,8 +2500,8 @@ def _dom_view_term(field, op, value, where):
             raise DomainError("%s takes a text value, in %s" % (field, where))
         return value
     if field == "table.group":
-        if value not in ("operation", "app", "type"):
-            raise DomainError("table.group is operation, app or type, in %s" % where)
+        if value not in ("operation", "app", "type", "slow_query"):
+            raise DomainError("table.group is operation, app, type or slow_query, in %s" % where)
         return value
     if field == "table.sort":
         if not (isinstance(value, list) and len(value) == 2 and value[0] in ("operation",) + DOM_COLUMNS and value[1] in ("asc", "desc")):
@@ -2502,8 +2575,18 @@ def _dom_term(t):
         if op not in ("<", "<=", ">", ">="):
             raise DomainError("time only takes <, <=, >, >=, in %s" % where)
         dom_parse_ts(value)
+    if field == F_DUR:
+        vals = value if op in ("in", "not in") else [value]
+        if op not in ("=", "!=", "in", "not in") or not vals or not all(isinstance(v, str) and dur_range(v) for v in vals):
+            raise DomainError("%s only takes =, !=, in, not in, with ranges of ms like \"100-150\" or \"5000-\", in %s"
+                              % (F_DUR, where))
     if field in ("file", "database") and op not in ("=", "!=", "in", "not in"):
         raise DomainError("%s only takes =, !=, in, not in, in %s" % (field, where))
+    if field == "ip":
+        if op not in ("=", "in"):
+            raise DomainError("ip only takes = and in, in %s" % where)
+        if not all(isinstance(v, str) and v for v in (value if op == "in" else [value])):
+            raise DomainError("ip values are client addresses (text), in %s" % where)
     return ("term", field, op, value)
 
 
@@ -2664,12 +2747,28 @@ def dom_compile(prefix_list):
     key = json.dumps(prefix_list, sort_keys=True)
     f = _DOM_COMPILED.get(key)
     if f is None:
-        node = dom_tree(prefix_list)
+        node = _dom_dur(dom_tree(prefix_list))
         f = (lambda fields: True) if node is None else (lambda fields, node=node: _dom_test(node, fields) is not False)
         if len(_DOM_COMPILED) > 64:
             _DOM_COMPILED.clear()
         _DOM_COMPILED[key] = f
     return f
+
+
+def _dom_dur(node):
+    """A tree with its F_DUR terms written as the duration comparisons they stand for."""
+    if node is None or node[0] != "term":
+        return node if node is None else (node[0],) + tuple(_dom_dur(n) for n in node[1:])
+    _, field, op, v = node
+    if field != F_DUR:
+        return node
+    out = None
+    for lo, hi in map(dur_range, v if op in ("in", "not in") else [v]):
+        r = ("term", "duration", ">=", lo)
+        if hi != math.inf:
+            r = ("&", r, ("term", "duration", "<", hi))
+        out = r if out is None else ("|", out, r)
+    return ("!", out) if op in DOM_NEGATIVE else out
 
 
 def _dom_is_detail(field):
@@ -2707,9 +2806,9 @@ def _dom_fact_pattern(node):
 
 def dom_split(node):
     """A validated tree -> what the app's own filters can hold, plus the rest:
-    {"file": [(op, values)], "database": [(op, values)], "time": [(op, seconds)],
+    {"file": [(op, values)], "database": [(op, values)], "time": [(op, seconds)], "ip": [(op, values)],
      "facts": {(by, name): {detail: set}}, "extra": tree or None}. Raises DomainError."""
-    out = {"file": [], "database": [], "time": [], "facts": {}, "extra": [], "view": _dom_view_default()}
+    out = {"file": [], "database": [], "time": [], "ip": [], "facts": {}, "extra": [], "view": _dom_view_default()}
     focus = []
     for n in dom_conjuncts(node):
         if n[0] == "term" and n[1] in DOM_VIEW:
@@ -2737,7 +2836,7 @@ def dom_split(node):
                 out[field].append((op, v if isinstance(v, list) else [v]))
             continue
         if dom_mentions(n, DOM_SELECTION):
-            raise DomainError("file, database and time can only be top-level conditions joined with \"&\" "
+            raise DomainError("file, database, time and ip can only be top-level conditions joined with \"&\" "
                               "(they choose which log lines are read at all), not inside \"|\" or \"!\"")
         fp = _dom_fact_pattern(n)
         if fp is not None and not set(fp[2]) & set(out["facts"].get((fp[0], fp[1]), ())):
@@ -2788,10 +2887,10 @@ def dom_view_terms(view):
     return [_dom_term(t) for t in raw]
 
 
-def dom_render(exclude_files, exclude_dbs, interval, facts, extra, view=None):
+def dom_render(exclude_files, exclude_dbs, interval, facts, extra, view=None, ips=()):
     """The app's filters as domain text, one top-level condition per line. exclude_dbs: names, None for the
     lines with no database; interval: (from, to) seconds, to exclusive; facts: [(by, name, {detail: values})];
-    extra: prefix list."""
+    extra: prefix list; ips: the client addresses the report is narrowed to."""
     parts = []
     if exclude_files:
         parts.append(("term", "file", "not in", sorted(exclude_files)))
@@ -2802,6 +2901,8 @@ def dom_render(exclude_files, exclude_dbs, interval, facts, extra, view=None):
         ts = lambda s: datetime.datetime.fromtimestamp(s, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")   # noqa: E731
         parts.append(("term", "time", ">=", ts(interval[0])))
         parts.append(("term", "time", "<", ts(interval[1])))
+    if ips:
+        parts.append(("term", "ip", "in", sorted(ips)))
     for by, name, fs in facts:
         terms = dom_and([("term", k, "in", sorted(v)) for k, v in sorted(fs.items())])
         parts.append(("|", ("term", DOM_FIELD_OF[by], "!=", list(name) if by == "issue" else name), terms))
@@ -2812,6 +2913,118 @@ def dom_render(exclude_files, exclude_dbs, interval, facts, extra, view=None):
         return "[]"
     line = lambda n: ", ".join(json.dumps(x, ensure_ascii=False) for x in dom_prefix(n))   # noqa: E731
     return "[\n    " + ",\n    ".join(line(p) for p in parts) + "\n]"
+
+
+# --------------------------------------------------------------------------- #
+# 4b. slow-query logs (pg_slow_queries.log): their own parser
+# --------------------------------------------------------------------------- #
+#
+# PostgreSQL's log of the queries that ran too long, one entry each:
+#
+#     --------------------------------------------------------------------------------
+#     2026-11-10 17:24:10.365 UTC my_db: approximate duration: 41 seconds
+#
+#     SELECT ...
+#       FROM ...
+#
+# An entry starts after a line of dashes, with a header (when the query was logged, in UTC, its database, how
+# long it ran); its SQL follows, up to the next line of dashes. The SQL is kept as text, never parsed: only its
+# *shape* (the text with every literal replaced by ?, see sq_shape()) is worked out, so the runs of one query
+# group together.
+
+SQ_SEP = re.compile(r"^-{10,}\s*$")
+SQ_HEAD = re.compile(r"^(?P<date>\d{4}-\d\d-\d\d)[ T](?P<time>(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d)(?P<frac>[.,]\d+)?\s+UTC\s+"
+                     r"(?:(?P<db>[^\s:]+)?:\s+)?approximate duration:\s*(?P<dur>\d+(?:\.\d+)?)\s*seconds?\b")
+SQ_NAME = re.compile(r"slow[_-]?quer", re.I)
+SQ_SNIFF = 8192         # characters of a file sq_sniff() reads
+SQ_SQL_MAX = 100_000    # characters of one query's SQL kept; the rest is cut (SlowQuery.cut)
+
+
+class SlowQuery(NamedTuple):
+    end: float          # when it was logged (it had then run `seconds`), seconds since 1970-01-01 UTC
+    db: Optional[str]   # None: no database named
+    seconds: float
+    sql: str
+    cut: bool           # the SQL was longer than SQ_SQL_MAX
+    shape: str          # id of its shape (see sq_shape())
+
+
+# literals and comments, matched in one pass: a quote inside a comment, or "--" inside a string, starts nothing
+_SQ_TOKEN = re.compile(r"(?P<cm>--[^\n]*|/\*.*?\*/)|(?P<str>[Ee]?'(?:[^']|'')*'?)|(?P<qid>\"(?:[^\"]|\"\")*\"?)"
+                       r"|(?P<num>(?<![\w$.])-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\w.]))", re.S)
+_SQ_LIST = re.compile(r"\(\s*\?(?:\s*,\s*\?)+\s*\)")                 # (?, ?, ?) -> (?)
+_SQ_ROWS = re.compile(r"\(\?\)(?:\s*,\s*\(\?\))+")                   # VALUES (?), (?) -> (?)
+_SQ_ARRAY = re.compile(r"ARRAY\[\s*\?(?:\s*,\s*\?)*\s*\]", re.I)      # ARRAY[?, ?] -> ARRAY[?]
+_SQ_SPACE = re.compile(r"\s+")
+
+
+def sq_fields(q):
+    """Everything a domain (see dom_compile) can test on one slow query."""
+    return {"kind": "slow_query", "duration": q.seconds, "sql": q.sql}
+
+
+def sq_censor(sql):
+    """The SQL with every string and number literal replaced by ? and its comments dropped, its layout kept."""
+    return _SQ_TOKEN.sub(lambda m: m.group() if m.lastgroup == "qid" else "" if m.lastgroup == "cm" else "?", sql)
+
+
+def sq_shape(sql):
+    """(id, text) of a query's shape: sq_censor()ed, lists of values folded into one, whitespace collapsed. The
+    runs of one query with other values share it."""
+    text = _SQ_SPACE.sub(" ", sq_censor(sql)).strip()
+    text = _SQ_ROWS.sub("(?)", _SQ_LIST.sub("(?)", _SQ_ARRAY.sub("ARRAY[?]", text)))
+    return hashlib.sha1(text.lower().encode("utf-8", "replace")).hexdigest()[:12], text
+
+
+def sq_sniff(path, name=None):
+    """Is this a slow-query log? Its name says so, or one of its first lines is an entry header."""
+    if SQ_NAME.search(name or os.path.basename(path)):
+        return True
+    try:
+        with opener(path) as fh:
+            head = fh.read(SQ_SNIFF)
+    except READ_ERRORS + (UnicodeError,):
+        return False
+    return any(SQ_HEAD.match(line) for line in head.splitlines()[:40])
+
+
+def sq_parse(path, only_db=None):
+    """Every entry of one slow-query log, in file order, and the text of each shape met:
+    ([SlowQuery], {shape id: text}). only_db: keep that database's entries (and those without one) only.
+    Raises READ_ERRORS when the file cannot be read."""
+    out, shapes = [], {}
+    head, sql, size = None, [], 0
+
+    def flush():
+        if head is None or (only_db is not None and head[1] not in (None, only_db)):
+            return
+        text = "\n".join(sql).strip("\n")
+        sid, stext = sq_shape(text)
+        shapes.setdefault(sid, stext[:2000])
+        out.append(SlowQuery(head[0], head[1], head[2], text, size > SQ_SQL_MAX, sid))
+
+    with opener(path) as fh:
+        for line in fh:
+            line = line.rstrip("\r\n")
+            m = SQ_HEAD.match(line) if line[:2].isdigit() else None
+            if m or SQ_SEP.match(line):
+                flush()
+                head, sql, size = None, [], 0
+                if m:
+                    try:
+                        end = stamp_minute(m["date"], m["time"][:5]) * 60 + int(m["time"][6:8]) + \
+                            (float("0." + m["frac"][1:]) if m["frac"] else 0.0)
+                    except ValueError:                      # an impossible date (2026-02-31): the entry is skipped
+                        continue
+                    head = (end, m["db"] or None, float(m["dur"]))
+                continue
+            if head is None:
+                continue
+            if size <= SQ_SQL_MAX:
+                sql.append(line[:SQ_SQL_MAX - size + 1] if size + len(line) > SQ_SQL_MAX else line)
+            size += len(line) + 1
+        flush()
+    return out, shapes
 
 
 # --------------------------------------------------------------------------- #

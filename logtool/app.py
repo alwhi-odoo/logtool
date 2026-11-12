@@ -57,6 +57,7 @@ MAX_HIST_OPS = 500      # operations that also get their own timeline (for the h
                         # a search tag on a busier operation than this just won't have a line -- the top
                         # 500 by time already covers what anyone would realistically want to compare
 MAX_ISSUES = 60         # distinct warning / error messages sent to the UI
+MAX_SQ_ROWS = 5000      # slow-query shapes sent to the UI (those with the most time)
 MAX_EXPORT_ISSUES = 5000   # ... and written to an export (all of them, on any realistic log)
 FACT_TOP = 12           # values of one detail (client IP, user id, ...) shown per popup / exported per row
 MAX_ISSUE_LINES = 200   # occurrences of one issue the details popup lists to pick from
@@ -79,6 +80,7 @@ BASE = OrderedDict()    # (included file ids, excluded dbs) -> merged Profile: e
 CUT_BASE = OrderedDict()   # (included file ids, excluded dbs, from, to) -> merged Profile for one time interval
 CUTS = OrderedDict()    # (included file ids, excluded dbs, excluded ops, from, to) -> interval result
 SUMMARIES = {}          # file id -> a previously exported summary (see export()), or None if the .json wasn't one
+SLOWQ = {}              # file id -> {"entries": [olp.SlowQuery], "shapes": {shape id: text}}: a slow-query log, parsed
 LOCK = threading.RLock()
 LOAD_LOCK = threading.RLock()   # parsing a new file: held without LOCK, so other requests keep being answered meanwhile
 DIR_LOCK = threading.Lock()
@@ -570,9 +572,13 @@ def _decompress_once(path, reserved=0):
         return None
 
 
+def _loaded(fid):
+    return fid in CHUNKS or fid in SUMMARIES or fid in SLOWQ
+
+
 def _load(f):
     """Parse one file once (see _load_batch)."""
-    if f["id"] not in CHUNKS and f["id"] not in SUMMARIES:
+    if not _loaded(f["id"]):
         _load_batch([f])
 
 
@@ -580,7 +586,7 @@ def _load_pending():
     """Parse the files added since the last request -- all of them in one go, before taking LOCK, so the file
     list, popups and other requests keep being answered while big logs are read."""
     with LOCK:
-        todo = [FILES[i] for i in ORDER if i not in CHUNKS and i not in SUMMARIES]
+        todo = [FILES[i] for i in ORDER if not _loaded(i)]
     if todo:
         _load_batch(todo)
     with LOCK:                                      # unloaded while it was being read: drop what was parsed
@@ -590,13 +596,14 @@ def _load_pending():
 
 
 def _load_batch(files):
-    """Parse files once: Odoo logs (their per-database profiles and minute index) or previously exported
-    summaries (see export(), recognised by their .json extension). Many files at once go the fast way: every
+    """Parse files once: Odoo logs (their per-database profiles and minute index), PostgreSQL slow-query logs
+    (see olp.sq_parse, recognised by their name or first lines) or previously exported summaries (see export(),
+    recognised by their .json extension). Many files at once go the fast way: every
     compressed one is decompressed at the same time (zlib / bz2 release the GIL, so threads use every core),
     then all of them are parsed in one profile_files() call, so their chunks share the worker pool instead of
     one file after the other."""
     with LOAD_LOCK:                                 # one load at a time; another thread may have done these meanwhile
-        files = [f for f in files if f["id"] not in CHUNKS and f["id"] not in SUMMARIES]
+        files = [f for f in files if not _loaded(f["id"])]
         logs = []
         for f in files:
             if f["name"].lower().endswith(".json"):
@@ -604,6 +611,16 @@ def _load_batch(files):
                 f["kind"], f["usable"] = "summary", summary is not None
                 f["problem"] = None if summary is not None else "not a logtool export"
                 SUMMARIES[f["id"]] = summary
+            elif olp.sq_sniff(f["path"], f["name"]):
+                f["kind"], err = "slowq", None
+                try:
+                    entries, shapes = olp.sq_parse(f["path"], ONLY_DB)
+                except olp.READ_ERRORS as e:
+                    entries, shapes, err = [], {}, "could not be read (%s)" % e
+                SLOWQ[f["id"]] = {"entries": entries, "shapes": shapes}
+                f["usable"] = bool(entries)
+                f["problem"] = err or (None if entries else "no slow queries recognised" if ONLY_DB is None
+                                       else "no slow queries of database %s (or without one)" % ONLY_DB)
             else:
                 f["kind"] = "log"
                 logs.append(f)
@@ -885,12 +902,13 @@ def _select(exclude_db, exclude_file, init):
     files = [FILES[i] for i in ORDER]
     for f in files:
         _load(f)
-    logs = [f for f in files if f.get("kind") != "summary"]
-    if not logs:
+    logs = [f for f in files if f.get("kind") == "log"]
+    slow = [f for f in files if f.get("kind") == "slowq"]
+    if not logs and not slow:
         raise NoData("no files loaded" if not files else "no log files loaded (only imported summaries)")
     inc = [f for f in logs if f["id"] not in exclude_file and f["usable"]]
-    if not inc:
-        raise NoData("no files selected" if any(f["usable"] for f in logs)
+    if not inc and not _sq_files(exclude_file):
+        raise NoData("no files selected" if any(f["usable"] for f in logs + slow)
                      else "none of the loaded files contains Odoo log lines")
 
     # databases that exist in the selected files (a file's private dbs vanish with it)
@@ -899,6 +917,9 @@ def _select(exclude_db, exclude_file, init):
         for c in CHUNKS[f["id"]]:
             for db, child in c.parts.items():
                 counts[db] = counts.get(db, 0) + child.header_ok
+    for f in _sq_files(exclude_file):                    # a slow query counts as one line of its database
+        for q in SLOWQ[f["id"]]["entries"]:
+            counts[q.db or NONE_DB] = counts.get(q.db or NONE_DB, 0) + 1
     dbs = sorted(((d, n) for d, n in counts.items() if d != NONE_DB), key=lambda kv: -kv[1])
     if NONE_DB in counts:
         dbs.append((NONE_DB, counts[NONE_DB]))
@@ -908,6 +929,82 @@ def _select(exclude_db, exclude_file, init):
     elif dbs and all(d in exclude_db for d, _ in dbs):
         exclude_db = set()                  # everything excluded (e.g. its file was unloaded): show everything
     return files, inc, dbs, exclude_db
+
+
+def _sq_files(exclude_file):
+    """The selected slow-query logs."""
+    return [FILES[i] for i in ORDER if FILES[i].get("kind") == "slowq" and FILES[i].get("usable") and i not in exclude_file]
+
+
+def _sq_keep(flt):
+    """A predicate: is this olp.SlowQuery kept by the filters? The domain's custom conditions see it as kind
+    "slow_query" (see olp.sq_fields); its ip keeps none (a slow query has no client). Item filters narrow rows of
+    the other tables, so they leave slow queries alone."""
+    ff = flt[1] or {}
+    if ff.get("client"):
+        return lambda q: False
+    xp = olp.dom_compile(ff["extra"]) if ff.get("extra") else None
+    return (lambda q: True) if xp is None else (lambda q: xp(olp.sq_fields(q)))
+
+
+def _slow_queries(exclude_db, exclude_file, interval=None, flt=NOFILT):
+    """The slow queries of the selection (logged in the interval, seconds [from, to)), in time order:
+    [(id, olp.SlowQuery)], the id being "<file id>:<index in it>"."""
+    keep, (lo, hi) = _sq_keep(flt), interval or (None, None)
+    out = []
+    for f in _sq_files(exclude_file):
+        for i, q in enumerate(SLOWQ[f["id"]]["entries"]):
+            if (q.db or NONE_DB) not in exclude_db and (lo is None or lo <= q.end < hi) and keep(q):
+                out.append(("%s:%d" % (f["id"], i), q))
+    out.sort(key=lambda x: x[1].end)
+    return out
+
+
+def _sq_get(qid):
+    """One loaded slow query by id (see _slow_queries)."""
+    fid, _, i = (qid or "").partition(":")
+    try:
+        return SLOWQ[fid]["entries"][int(i)]
+    except (KeyError, ValueError, IndexError):
+        raise NoData("this slow query is not loaded any more")
+
+
+def _sq_shape_text(sid):
+    for sq in SLOWQ.values():
+        if sid in sq["shapes"]:
+            return sq["shapes"][sid]
+    return ""
+
+
+def _sq_head(sql):
+    """The first characters of a query, on one line (the table shows them)."""
+    return " ".join(sql[:400].split())[:200]
+
+
+def _sq_view(qs):
+    """The slow queries of the selection, as the table and the statistic show them: {"rows": one per shape (the
+    MAX_SQ_ROWS with the most time), each {"shape", "id" (its longest run), "n" (runs), "total_s", "avg_s", "max_s",
+    "last" (when the last one was logged, seconds), "dbs" (their databases), "head" (its shape's text, on one line),
+    "runs": [[logged at, seconds], ...] in time order}, "n" (runs), "total_s", "max_s", "shapes", "labels": {shape:
+    text} of the rows}."""
+    per = {}
+    for k, q in qs:
+        e = per.get(q.shape)
+        if e is None:
+            e = per[q.shape] = {"shape": q.shape, "id": k, "s": q.seconds, "dbs": set(), "runs": []}
+        elif q.seconds > e["s"]:
+            e["id"], e["s"] = k, q.seconds
+        e["dbs"].add(q.db)
+        e["runs"].append([round(q.end, 3), q.seconds])
+    rows = []
+    for e in sorted(per.values(), key=lambda e: -sum(s for _, s in e["runs"]))[:MAX_SQ_ROWS]:
+        total = sum(s for _, s in e["runs"])
+        rows.append({"shape": e["shape"], "id": e["id"], "n": len(e["runs"]), "total_s": total, "avg_s": total / len(e["runs"]),
+                     "max_s": e.pop("s"), "last": e["runs"][-1][0], "dbs": sorted(e["dbs"], key=lambda d: d or ""),
+                     "head": _sq_head(_sq_shape_text(e["shape"])), "runs": e["runs"]})
+    return {"rows": rows, "n": len(qs), "total_s": sum(q.seconds for _, q in qs),
+            "max_s": max((q.seconds for _, q in qs), default=0), "shapes": len(per),
+            "labels": {r["shape"]: _sq_shape_text(r["shape"])[:300] for r in rows}}
 
 
 def _base(ids, excl, flt=NOFILT):
@@ -1005,13 +1102,19 @@ def analyze(exclude_db, exclude_file, interval, init, have_hist=None, have_rows=
         sel = "%s|%s|%s|%s" % (",".join(ids), "\x1f".join(sorted(excl)), flt[0] or "", ONLY_DB or "")
         hist_key = sel                                                          # the operation timelines depend on this only
         view, rows, rows_key = full["summary"], full["rows"], sel + "|full"
+        slow = _slow_queries(excl, exclude_file, None, flt)
+        window = full["window"]
+        if not window and slow:                                                 # slow-query logs alone: their span
+            window = [int(slow[0][1].end), int(slow[-1][1].end) + 1]
+            view = dict(view, stats=dict(view["stats"], window=[_iso(window[0]), _iso(window[1] - 1)],
+                                         duration_s=window[1] - 1 - window[0]))
         if interval:
             lo, hi = interval
-            if full["window"]:                                                  # nothing outside the logs can be selected
-                lo, hi = max(lo, full["window"][0]), min(hi, full["window"][1])
-            if not full["window"] or lo >= hi:
+            if window:                                                          # nothing outside the logs can be selected
+                lo, hi = max(lo, window[0]), min(hi, window[1])
+            if not window or lo >= hi:
                 raise NoData("the interval lies outside the loaded logs")
-            if (lo, hi) == tuple(full["window"]):
+            if (lo, hi) == tuple(window):
                 interval = None
             else:
                 interval = (lo, hi)
@@ -1021,6 +1124,7 @@ def analyze(exclude_db, exclude_file, interval, init, have_hist=None, have_rows=
                     prof = _cut(inc, ids, excl, lo, hi, flt)
                     cut = _remember(CUTS, key, {"summary": _summary(prof, inc), "rows": _op_rows(prof)})
                 view, rows, rows_key = cut["summary"], cut["rows"], "%s|%d-%d" % (sel, lo, hi)
+                slow = [x for x in slow if lo <= x[1].end < hi]
 
         timeline = full["timeline"]
         # what the client has pinned (chart items, selected errors) even when it is outside the top MAX_ISSUES
@@ -1033,9 +1137,9 @@ def analyze(exclude_db, exclude_file, interval, init, have_hist=None, have_rows=
             whole = _base(ids, excl, flt)
             prof = _cut(inc, ids, excl, interval[0], interval[1], flt) if interval else whole
             base = _timeline_base(prof)["base"]
-            rows = [dict(_issue_json(prof, k, prof.issues[k], base), pinned=True) for k in pin_issues if k in prof.issues]
-            if rows:
-                view = dict(view, issues=view["issues"] + rows)
+            pinned = [dict(_issue_json(prof, k, prof.issues[k], base), pinned=True) for k in pin_issues if k in prof.issues]
+            if pinned:
+                view = dict(view, issues=view["issues"] + pinned)
             pinned_ops = [{"family": whole.det_fam.get(o, ""), "app": whole.det_app.get(o, ""), "operation": o,
                            "hist": _rebin(whole.det[o].hist, timeline["base"])} for o in pin_ops if o in whole.det]
         return {
@@ -1043,7 +1147,8 @@ def analyze(exclude_db, exclude_file, interval, init, have_hist=None, have_rows=
             "databases": dbs,
             "excluded_db": sorted(excl),
             "interval": list(interval) if interval else None,
-            "window": full["window"],
+            "window": window,
+            "slowq": _sq_view(slow),
             "view": dict(view, rows=None if have_rows == rows_key else rows, rows_key=rows_key),
             "full_totals": full["summary"]["totals"],
             # the histogram is always the whole file + database selection, so it only travels when that
@@ -1147,15 +1252,81 @@ def _durations(bs):
     counts = [0.0] * (len(DUR_EDGES) + 1)
     for b in bs:
         if b.sample:
-            w, smp = b.seen / len(b.sample), sorted(b.sample)
-            at = [0] + [bisect.bisect_left(smp, e / 1000) for e in DUR_EDGES] + [len(smp)]
-            for i in range(len(counts)):
-                counts[i] += w * (at[i + 1] - at[i])
+            _bin_add(counts, sorted(b.sample), b.seen / len(b.sample))
+    return {"bins": _bins(counts), "estimated": any(b.seen > len(b.sample) for b in bs)}
+
+
+def _bin_add(counts, secs, w=1):
+    """Adds sorted durations `secs` (seconds), each standing for `w` calls, to the DUR_EDGES bins `counts`."""
+    at = [0] + [bisect.bisect_left(secs, e / 1000) for e in DUR_EDGES] + [len(secs)]
+    for i in range(len(counts)):
+        counts[i] += w * (at[i + 1] - at[i])
+
+
+def _bins(counts):
+    """[[from ms, to ms, calls], ...] of DUR_EDGES bin counts, the empty bins before the first and after the last
+    call left out (None: no bound)."""
     bins = [[DUR_EDGES[i - 1] if i else 0, DUR_EDGES[i] if i < len(DUR_EDGES) else None, round(n)]
             for i, n in enumerate(counts)]
     used = [i for i, b in enumerate(bins) if b[2]]
-    return {"bins": bins[used[0]:used[-1] + 1] if used else [],
-            "estimated": any(b.seen > len(b.sample) for b in bs)}
+    return bins[used[0]:used[-1] + 1] if used else []
+
+
+def request_durations(exclude_db, exclude_file, interval, flt=NOFILT):
+    """How long the requests of the selection took (the "Request time" statistic's histogram): see _durations."""
+    with LOCK:
+        _, inc, _, exclude_db = _select(exclude_db, exclude_file, False)
+        ids, excl = tuple(f["id"] for f in inc), frozenset(exclude_db)
+        prof = _heavy(_prof_for(inc, ids, excl, interval, flt))
+        return {"durations": _durations([b for op, b in prof.det.items()
+                                         if prof.det_fam.get(op) not in olp.JOB_KINDS])}
+
+
+def _stamp_secs(stamp):
+    """Seconds (log clock) of an occurrence's "YYYY-MM-DDTHH:MM:SS..." stamp."""
+    return olp.stamp_minute(stamp[:10], stamp[11:16]) * 60 + int(stamp[17:19])
+
+
+def cron_requests(name, exclude_db, exclude_file, interval, flt=NOFILT):
+    """The requests that ran while cron operation `name` was running, re-found by re-reading the loaded files: a
+    request counts when its span (its end, less its duration) overlaps a run's, to the second. {"runs", "requests",
+    "avg_ms" (None: none), "durations" (see _durations)}."""
+    with LOCK:
+        _, inc, _, exclude_db = _select(exclude_db, exclude_file, False)
+        files = [(f["id"], f["name"], f["path"]) for f in inc]
+    lo, hi = interval if interval else (None, None)
+    _check_on_disk(files)
+    kw = dict(by="operation", name=None, exclude_db=exclude_db, lo=lo, hi=hi, limit=sys.maxsize, ff=flt[1],
+              only_db=ONLY_DB)
+    tasks = [(f[2], piece) for f in files for piece in _pieces(f[0], f[2], lo, hi)]
+    runs, reqs = [], []
+    for part in olp.scan_pieces("op", tasks, kw):
+        for o in part:
+            if o["seconds"] is None:
+                continue
+            end = _stamp_secs(o["stamp"])
+            if o["operation"] == name:
+                runs.append((end - o["seconds"], end))
+            elif o["family"] not in olp.JOB_KINDS:
+                reqs.append((end - o["seconds"], end, o["seconds"]))
+    merged = []                                    # the runs' spans, overlapping ones joined: [(start, end)] by start
+    for a, b in sorted(runs):
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    starts = [m[0] for m in merged]
+    during = []
+    for a, b, secs in reqs:
+        k = bisect.bisect_right(starts, b) - 1     # the last run starting by the request's end
+        if k >= 0 and merged[k][1] >= a:
+            during.append(secs)
+    during.sort()
+    counts = [0.0] * (len(DUR_EDGES) + 1)
+    _bin_add(counts, during)
+    return {"runs": len(runs), "requests": len(during),
+            "avg_ms": round(1000 * sum(during) / len(during), 3) if during else None,
+            "durations": {"bins": _bins(counts), "estimated": False}}
 
 
 def _detail(prof, by, name, facts, logged=()):
@@ -1193,8 +1364,12 @@ def detail(by, name, exclude_db, exclude_file, interval, flt=NOFILT):
         ids, excl = tuple(f["id"] for f in inc), frozenset(exclude_db)
         prof = _heavy(_prof_for(inc, ids, excl, interval, flt))
         prof0 = _heavy(_prof_for(inc, ids, excl, interval)) if flt[0] else prof
-        return _detail(prof, by, name, _facts_view(prof, prof0, by, name, flt),
-                       _facts_view(prof, prof0, by, name, flt, logged=True))
+        d = _detail(prof, by, name, _facts_view(prof, prof0, by, name, flt),
+                    _facts_view(prof, prof0, by, name, flt, logged=True))
+        if d["found"] and olp.F_DUR in ((flt[1] or {}).get(by, {}).get(name) or {}):
+            # filtered on its durations: every call's, from the unfiltered selection, so more spans can be picked
+            d["durations"] = dict(_durations([prof0.det[op] for op in _group_ops(prof0, by, name)]), unfiltered=True)
+        return d
 
 
 def issue_detail(key, exclude_db, exclude_file, interval, flt=NOFILT):
@@ -1205,6 +1380,99 @@ def issue_detail(key, exclude_db, exclude_file, interval, flt=NOFILT):
         prof = _prof_for(inc, ids, excl, interval, flt)
         prof0 = _prof_for(inc, ids, excl, interval) if flt[0] else prof
         return {"found": key in prof.issues, "facts": _facts_view(prof, prof0, "issue", key, flt)}
+
+
+def slowq_detail(qid, exclude_db, exclude_file, interval, flt=NOFILT):
+    """One slow query's form: the query, its SQL in full, and the runs of its shape in the selection ("same":
+    their count, time, durations histogram and the MAX_ISSUE_LINES longest of them, in time order)."""
+    with LOCK:
+        _, _, _, exclude_db = _select(exclude_db, exclude_file, False)
+        q = _sq_get(qid)
+        same = [(k, x) for k, x in _slow_queries(exclude_db, exclude_file, interval, flt) if x.shape == q.shape]
+        text = _sq_shape_text(q.shape)
+    secs = sorted(x.seconds for _, x in same)
+    counts = [0.0] * (len(DUR_EDGES) + 1)
+    _bin_add(counts, secs)
+    shown = sorted(sorted(same, key=lambda kx: -kx[1].seconds)[:MAX_ISSUE_LINES], key=lambda kx: kx[1].end)
+    return {"id": qid, "t": q.end, "db": q.db, "s": q.seconds, "sql": q.sql, "cut": q.cut, "shape": q.shape,
+            "shape_text": text,
+            "same": {"n": len(same), "total_s": sum(secs), "max_s": secs[-1] if secs else 0,
+                     "first": same[0][1].end if same else None, "last": same[-1][1].end if same else None,
+                     "durations": {"bins": _bins(counts), "estimated": False},
+                     "items": [{"id": k, "t": x.end, "db": x.db, "s": x.seconds} for k, x in shown]}}
+
+
+def slowq_running(qid, exclude_db, exclude_file, interval, flt=NOFILT):
+    """The requests and jobs that ran while one slow query did (their span overlaps its, to the second), in its
+    database, re-found by re-reading the loaded logs: {"n", "items": the MAX_ISSUE_LINES longest, each
+    {"operation", "family", "stamp" (when it ended), "seconds"}}."""
+    with LOCK:
+        _, inc, dbs, exclude_db = _select(exclude_db, exclude_file, False)
+        q = _sq_get(qid)
+        files = [(f["id"], f["name"], f["path"]) for f in inc]
+        excl = set(exclude_db) | ({d for d, _ in dbs} - {q.db} if q.db else set())
+        prof = _base(tuple(f["id"] for f in inc), frozenset(exclude_db), flt)
+        longest = max((b.mx for b in prof.det.values()), default=0.0)    # a request ending this late may still overlap
+    start = q.end - q.seconds
+    lo, hi = int(start), int(q.end + longest) + 2
+    _check_on_disk(files)
+    kw = dict(by="operation", name=None, exclude_db=excl, lo=lo, hi=hi, limit=sys.maxsize, ff=flt[1], only_db=ONLY_DB)
+    tasks = [(f[2], piece) for f in files for piece in _pieces(f[0], f[2], lo, hi)]
+    out = []
+    for part in olp.scan_pieces("op", tasks, kw):
+        for o in part:
+            end = _stamp_secs(o["stamp"])
+            if o["seconds"] is not None and end - o["seconds"] <= q.end and end + 1 > start:   # stamps are to the second
+                out.append(o)
+    out.sort(key=lambda o: -o["seconds"])
+    return {"n": len(out), "items": [{"operation": o["operation"], "family": o["family"], "stamp": o["stamp"],
+                                      "seconds": o["seconds"]} for o in out[:MAX_ISSUE_LINES]]}
+
+
+def op_slowq(by, name, exclude_db, exclude_file, interval, flt=NOFILT):
+    """The slow queries that ran while the calls of one operation / app / type did (their spans overlap, to the
+    second, in the same database), its calls re-found by re-reading the loaded logs around them, one item per shape:
+    {"n" (shapes), "runs", "items": the MAX_ISSUE_LINES shapes with the most time, each {"shape", "id" (its longest
+    such run), "n" (runs), "total_s", "max_s", "last", "dbs", "head" (its shape's text), "calls" (how many of the
+    calls they overlap, added up)}}."""
+    with LOCK:
+        _, inc, _, exclude_db = _select(exclude_db, exclude_file, False)
+        slow = _slow_queries(exclude_db, exclude_file, interval, flt)
+        files = [(f["id"], f["name"], f["path"]) for f in inc]
+        prof = _base(tuple(f["id"] for f in inc), frozenset(exclude_db), flt)
+        longest = max((prof.det[op].mx for op in _group_ops(prof, by, name)), default=0.0)
+    if not slow or not files:
+        return {"n": 0, "runs": 0, "items": []}
+    lo, hi = int(min(q.end - q.seconds for _, q in slow)), int(slow[-1][1].end + longest) + 2
+    if interval:
+        lo, hi = max(lo, interval[0]), min(hi, interval[1])
+    _check_on_disk(files)
+    kw = dict(by=by, name=name, exclude_db=exclude_db, lo=lo, hi=hi, limit=sys.maxsize, ff=flt[1], only_db=ONLY_DB)
+    tasks = [(f[2], piece) for f in files for piece in _pieces(f[0], f[2], lo, hi)]
+    calls = sorted((_stamp_secs(o["stamp"]), o["seconds"], o["db"]) for part in olp.scan_pieces("op", tasks, kw)
+                   for o in part if o["seconds"] is not None)
+    ends = [c[0] for c in calls]
+    per, runs = {}, 0
+    for k, q in slow:
+        start = q.end - q.seconds                  # a call overlapping it ends after it started, and by q.end + longest
+        n = sum(1 for end, secs, db in calls[bisect.bisect_left(ends, int(start)):bisect.bisect_right(ends, q.end + longest + 1)]
+                if end - secs <= q.end and end + 1 > start and (q.db is None or db == q.db))
+        if not n:
+            continue
+        runs += 1
+        e = per.get(q.shape)
+        if e is None:
+            e = per[q.shape] = {"shape": q.shape, "id": k, "n": 0, "total_s": 0.0, "max_s": q.seconds, "dbs": set(), "calls": 0}
+        elif q.seconds > e["max_s"]:
+            e["id"], e["max_s"] = k, q.seconds
+        e["n"] += 1
+        e["total_s"] += q.seconds
+        e["last"] = q.end
+        e["dbs"].add(q.db)
+        e["calls"] += n
+    items = sorted(per.values(), key=lambda e: -e["total_s"])[:MAX_ISSUE_LINES]
+    return {"n": len(per), "runs": runs, "items": [dict(e, dbs=sorted(e["dbs"], key=lambda d: d or ""),
+                                                        head=_sq_head(_sq_shape_text(e["shape"]))) for e in items]}
 
 
 def timeline(exclude_db, exclude_file, interval, flt, issue_keys, pin_ops=()):
@@ -1278,6 +1546,9 @@ EXPORT_FIELDS = {
     "logins": "Login lines paired with the access line of the same worker: account, ip, result, count, first / last.",
     "log_levels": "Log lines per level. What is missing here (e.g. no DEBUG) is missing from everything else.",
     "limits": "What this log cannot show, worked out from what it contains. Read before drawing conclusions.",
+    "slow_queries": "The PostgreSQL slow-query logs of the selection, without their SQL: how many queries, how long "
+                    "they ran (s), by_shape (runs of one query whatever its values, its shape id being a hash of its "
+                    "SQL with every literal replaced by ?) and the longest runs. t is when it was logged (it ended).",
 }
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
@@ -1501,7 +1772,29 @@ def export(exclude_db, exclude_file, interval, flt=NOFILT):
             # the "Requests over time" histogram, so an imported summary (see _summary_view()) can still
             # show it; older exports simply lack this key and import with no histogram, as before.
             "hist": timeline,
+            "slow_queries": _sq_export(_slow_queries(excl, exclude_file, interval, flt)),
         }
+
+
+SQ_EXPORT_TOP = 100     # shapes and runs of the slow queries an export lists
+
+
+def _sq_export(qs):
+    """The slow queries for export(): numbers and shape ids only, no SQL and no database (see EXPORT_FIELDS)."""
+    per = {}
+    for _, q in qs:
+        e = per.setdefault(q.shape, {"shape": q.shape, "n": 0, "total_s": 0.0, "max_s": 0.0, "first": q.end, "last": q.end})
+        e["n"] += 1
+        e["total_s"] += q.seconds
+        e["max_s"] = max(e["max_s"], q.seconds)
+        e["last"] = q.end
+    stamp = lambda t: _iso(t) + ".%03d" % int(t % 1 * 1000)   # noqa: E731
+    return {"n": len(qs), "total_s": sum(q.seconds for _, q in qs), "max_s": max((q.seconds for _, q in qs), default=0),
+            "shapes": len(per),
+            "by_shape": [dict(e, first=stamp(e["first"]), last=stamp(e["last"]))
+                         for e in sorted(per.values(), key=lambda e: -e["total_s"])[:SQ_EXPORT_TOP]],
+            "longest": [{"t": stamp(q.end), "s": q.seconds, "shape": q.shape}
+                        for _, q in sorted(qs, key=lambda kq: -kq[1].seconds)[:SQ_EXPORT_TOP]]}
 
 
 HTML_DETAILS = 50       # rows of the apps, types and errors tables whose details popup Export HTML carries ...
@@ -1514,14 +1807,27 @@ HTML_NOTE = ("Exported %s UTC: a read-only copy of the page, of the selected dat
              % ("%s", HTML_OP_DETAILS, HTML_DETAILS))
 
 
-def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=None, desc=""):
+def _filter_desc(interval, flt):
+    """What Export HTML says the page is filtered by: which kinds of filter and how many, never what they name (a
+    filter can name clients, users, records...)."""
+    ff = flt[1] or {}
+    nf = sum(len(v) for by, rows in ff.items() if by not in ("extra", "client") for want in rows.values() for v in want.values())
+    nx = sum(isinstance(x, list) for x in ff.get("extra") or ())
+    ni = len(ff.get("client", {}).get(olp.F_IP, ()))
+    n = lambda k, one: "%d %s%s" % (k, one, "" if k == 1 else "s")      # noqa: E731
+    return " · ".join((["time interval"] if interval else []) + ([n(nf, "item filter")] if nf else []) +
+                      ([n(nx, "custom condition")] if nx else []) + (["only " + n(ni, "client IP")] if ni else []))
+
+
+def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=None):
     """What Export HTML builds into the page (see the snapshot in index.html): the analyze() answer the page
     shows now, cut down to the selected databases (the others are not even named), plus the details popup of
     the top rows of each table (see HTML_OP_DETAILS). The selected databases' own data is kept as it is; only what lines
     without a database (NONE_DB) logged -- the rows and messages they show up in -- is censored like export()'s
     (the other databases' and the files' names, emails, IPs blanked), with clients, accounts, user and record ids
     pseudonymized too. view: the page's view settings (see viewState() in app.js), whose items are censored the
-    same way so they still match."""
+    same way so they still match. The filter itself stays out: only how many of each kind (_filter_desc), and the
+    view's search boxes are emptied (they hold whatever was typed; every row is in the page anyway)."""
     a = analyze(exclude_db, exclude_file, interval, False, flt=flt, pins=pins)
     if a.get("imported"):
         raise NoData("an imported summary cannot be exported as HTML")
@@ -1589,8 +1895,17 @@ def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=
             details["\x1f".join(("issue",) + issue_key(key))] = {
                 "found": True, "facts": facts(f) if key in tainted["issue"] else f}
 
+        # the forms of the longest run of the slow-query shapes with the most time, their SQL censored (literals
+        # replaced by ?) like the shapes the table shows
+        for r in a["slowq"]["rows"][:HTML_OP_DETAILS]:
+            d = slowq_detail(r["id"], set(excl), exclude_file, iv, flt)
+            details["slowq\x1f" + r["id"]] = dict(d, sql=olp.sq_censor(d["sql"]))
+
     # an interval or a focus: the histogram shows just that span, at its finer buckets (see timeline())
     view = dict(view or {})
+    for k in ("table", "errors"):
+        if isinstance(view.get(k), dict):
+            view[k] = dict(view[k], search="")
     span = iv or (tuple(view["focus"]) if isinstance(view.get("focus"), list) and len(view["focus"]) == 2 else None)
     focus = None
     if span:
@@ -1608,7 +1923,7 @@ def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=
                 it[k] = scrub(by, it[k])
     return {
         "note": HTML_NOTE % datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M"),
-        "filter": desc,
+        "filter": _filter_desc(iv, flt),
         "view": view,
         "details": details,
         "focus": focus,
@@ -1619,6 +1934,119 @@ def export_html(exclude_db, exclude_file, interval, flt=NOFILT, pins=None, view=
                         hist=dict(a["hist"], ops=[op(o) for o in a["hist"]["ops"]]),
                         pinned_ops=[op(o) for o in a["pinned_ops"]]),
     }
+
+
+TEXT_BARS = 60          # Export text: at most this many histogram buckets (one line each), ...
+TEXT_BAR_W = 50         # ... the longest bar, in characters ...
+TEXT_AROUND = 3         # ... and the log lines shown before and after each occurrence
+TEXT_RULE = "=" * 100
+
+
+def _text_minutes(m):
+    return "%d min" % m if m < 60 else "%d h" % (m // 60) if m < 1440 else "%d d" % (m // 1440)
+
+
+def export_text(exclude_db, exclude_file, interval, flt=NOFILT):
+    """Export text: the selection as a plain-text report, for one database and the lines without one. The requests
+    histogram, every operation (name, calls, average ms) with the details behind it but its client IPs, then every
+    occurrence's log line with the TEXT_AROUND lines before and after it, oldest first -- the database's own lines
+    only, not those without one. Raises NoData when more than one database is selected."""
+    a = analyze(exclude_db, exclude_file, interval, False, flt=flt)
+    if a.get("imported"):
+        raise NoData("an imported summary has no log lines to export as text")
+    with LOCK:
+        _, inc, dbs, excl = _select(set(a["excluded_db"]), exclude_file, False)
+        keep = {d for d, _ in dbs} - set(excl)
+        if len(keep - {NONE_DB}) > 1:
+            raise NoData("Export text holds one database (and the lines without one): select only one of %s"
+                         % ", ".join(sorted(keep - {NONE_DB})))
+        ids, excl = tuple(f["id"] for f in inc), frozenset(excl)
+        iv = tuple(a["interval"]) if a["interval"] else None
+        prof = _heavy(_prof_for(inc, ids, excl, iv, flt))
+        prof0 = _heavy(_prof_for(inc, ids, excl, iv)) if flt[0] else prof
+        rows = [(r, _facts_view(prof, prof0, "operation", r["operation"], flt)) for r in prof.as_rows(("operation",))]
+        per_min = _timeline_base(prof)["total"]
+        files = [(f["id"], f["name"], f["path"]) for f in inc]
+    out = []
+    w = out.append
+
+    # the requests histogram: one line per bucket, empty ones included
+    if per_min:
+        lo_m, hi_m = min(per_min), max(per_min)
+        base = next((n for n in NICE_MIN if (hi_m - lo_m + 1) / n <= TEXT_BARS), NICE_MIN[-1])
+        bins = {b[0]: b[1] for b in _rebin(per_min, base)}
+        top = max(bins.values()) or 1
+        w("REQUESTS OVER TIME (%s buckets, UTC as logged)\n\n" % _text_minutes(base))
+        for m in range(lo_m // base * base, hi_m + 1, base):
+            n = bins.get(m, 0)
+            bar = "#" * (max(1, round(TEXT_BAR_W * n / top)) if n else 0)
+            w("%s  %-*s %s\n" % (_iso(m * 60)[:16].replace("T", " "), TEXT_BAR_W, bar, format(n, ",")))
+    else:
+        w("REQUESTS OVER TIME\n\nNo requests in the selection.\n")
+    w("\n%s\n\n" % TEXT_RULE)
+
+    # every operation, with the details behind the grouping (the values its operation name collapses)
+    w("OPERATIONS (%s, by total time)\n\n" % format(len(rows), ","))
+    width = min(80, max([len(r["operation"]) for r, _ in rows] + [9]))
+    w("%-*s %10s %12s\n" % (width, "operation", "calls", "avg ms"))
+    for r, facts in rows:
+        w("\n%-*s %10s %12s\n" % (width, r["operation"], format(r["calls"], ","), format(round(r["avg_ms"]), ",")))
+        for f in facts:
+            if f["detail"] == olp.F_IP:                     # not shown (it still filters, like every detail)
+                continue
+            w("    %s (%s%s distinct, %s in all)\n" % (f["detail"], format(f["distinct"], ","), "+" if f["other_n"] else "",
+                                                     format(f["total"], ",")))
+            vw = min(60, max([len(v[0]) for v in f["values"]] + [5]))
+            w("        %-*s %10s %7s %9s %10s%s\n" % (vw, "value", "count", "share", "of calls", "avg ms",
+                                                  "  accounts logged in from it" if any(v[2:] and v[2] for v in f["values"]) else ""))
+            for k, v in enumerate(f["values"]):
+                avg = (f.get("avg_ms") or [None] * (k + 1))[k]
+                w("        %-*s %10s %6.1f%% %8.1f%% %10s%s\n" % (
+                    vw, v[0], format(v[1], ","), 100.0 * v[1] / f["total"] if f["total"] else 0,
+                    100.0 * v[1] / r["calls"] if r["calls"] else 0, "" if avg is None else format(round(avg), ","),
+                    "  " + ", ".join(v[2]) if v[2:] and v[2] else ""))
+            if f["distinct"] > len(f["values"]):
+                w("        ...and %s more values not kept\n" % format(f["distinct"] - len(f["values"]), ","))
+            if f["other_n"]:
+                w("        %s more not told apart (too many distinct values)\n" % format(f["other_n"], ","))
+    w("\n%s\n\n" % TEXT_RULE)
+
+    # the slow queries, one line per shape, most time first: how often, how long (their SQL is not written out)
+    slow = a["slowq"]
+    if slow["n"]:
+        w("SLOW QUERIES (%s runs of %s shapes, %s s in all, by total time%s)\n\n" % (
+            format(slow["n"], ","), format(slow["shapes"], ","), format(round(slow["total_s"]), ","),
+            "" if slow["shapes"] <= len(slow["rows"]) else "; the first %s" % format(len(slow["rows"]), ",")))
+        w("%-12s %8s %12s %10s %10s  %s\n" % ("shape", "runs", "total s", "avg s", "max s", "last logged (UTC)"))
+        for r in slow["rows"]:
+            w("%-12s %8s %12s %10s %10s  %s\n" % (r["shape"], format(r["n"], ","), format(r["total_s"], ",.1f"),
+                                                format(r["avg_s"], ",.1f"), format(r["max_s"], ",.1f"),
+                                                _iso(r["last"]).replace("T", " ") + ".%03d" % int(r["last"] % 1 * 1000)))
+        w("\n%s\n\n" % TEXT_RULE)
+
+    # every occurrence's own line, with the lines around it, oldest first
+    lo, hi = interval if interval else (None, None)
+    _check_on_disk(files)
+    kw = dict(by="operation", name=None, exclude_db=excl, lo=lo, hi=hi, limit=sys.maxsize, ff=flt[1], only_db=ONLY_DB)
+    tasks = [(f, piece) for f in files for piece in _pieces(f[0], f[2], lo, hi)]
+    occ = []
+    for (f, _piece), part in zip(tasks, olp.scan_pieces("op", [(f[2], p) for f, p in tasks], kw)):
+        occ += [dict(o, file=f[0]) for o in part]
+    ctx = {}
+    for fid, _name, path in files:
+        lines = [o["line"] for o in occ if o["file"] == fid]
+        if lines:
+            ctx[fid] = olp.occurrence_context(path, lines, keep - {NONE_DB}, TEXT_AROUND)
+    occ = [o for o in occ if o["line"] in ctx.get(o["file"], ())]   # those of lines without a database: left out
+    order = {f[0]: k for k, f in enumerate(files)}
+    occ.sort(key=lambda o: (o["stamp"], order[o["file"]], o["line"]))
+    w("RAW LOG LINES (%s occurrence%s, oldest first; > marks the occurrence)\n" % (format(len(occ), ","), "" if len(occ) == 1 else "s"))
+    for k, o in enumerate(occ, 1):
+        w("\n\n[%s] %s  %s%s\n" % (format(k, ","), o["stamp"].replace("T", " "), o["operation"],
+                                     "" if o["seconds"] is None else "  (%.3f s)" % o["seconds"]))
+        for i, line in ctx.get(o["file"], {}).get(o["line"], ()):
+            w("%s %s\n" % (">" if i == o["line"] else " ", line))
+    return "".join(out)
 
 
 def _file_json(f):
@@ -1670,7 +2098,7 @@ def reset():
     set_only_db(None)
     with LOCK:
         gone = list(FILES.values())
-        for cache in (FILES, CHUNKS, INDEX, SLICES, SUMMARIES):
+        for cache in (FILES, CHUNKS, INDEX, SLICES, SUMMARIES, SLOWQ):
             cache.clear()
         _forget_selections()
         ORDER.clear()
@@ -1727,6 +2155,8 @@ def set_only_db(name):
             INDEX.pop(fid, None)
             if fid in FILES:
                 FILES[fid]["usable"], FILES[fid]["problem"] = True, None
+        for fid in list(SLOWQ):                     # read again too, with the new database
+            del SLOWQ[fid]
         SLICES.clear()
         FCHUNKS.clear()
         _forget_selections()
@@ -1758,7 +2188,7 @@ def unload(fid):
             return jsonify({"error": "unknown file"}), 404
         ORDER.remove(fid)
         _forget_selections()
-        for cache in (CHUNKS, INDEX, SUMMARIES):
+        for cache in (CHUNKS, INDEX, SUMMARIES, SLOWQ):
             cache.pop(fid, None)
         for cache in (SLICES, FCHUNKS):
             for key in [k for k in cache if k[0] == fid]:
@@ -1784,9 +2214,10 @@ def _interval_arg():
 def _ff_arg():
     """The fact filters (see olp._facts_ok) from the `ff` argument, as (cache key, args.fact_filter), or NOFILT.
     ff is a JSON list of {"by": operation | app | family | issue, "name": row name, or [level, logger, message]
-    for an issue, "facts": {detail: [values]}}. Raises NoData with a message for the user."""
-    raw, xd = request.args.get("ff"), request.args.get("xd")
-    if not raw and not xd:
+    for an issue, "facts": {detail: [values]}}; each `ip` argument is a client address the whole report is
+    narrowed to. Raises NoData with a message for the user."""
+    raw, xd, ips = request.args.get("ff"), request.args.get("xd"), sorted(set(request.args.getlist("ip")) - {""})
+    if not raw and not xd and not ips:
         return NOFILT
     bad = NoData("ff must be a list of {by, name, facts: {detail: [values]}}")
     try:
@@ -1810,6 +2241,8 @@ def _ff_arg():
                 raise bad
             if by == "issue" and slot in olp.ISSUE_UNFILTERABLE:
                 continue
+            if slot == olp.F_DUR and not all(olp.dur_range(v) for v in vals):
+                raise NoData("%s values are ranges of ms like \"100-150\" or \"5000-\"" % olp.F_DUR)
             vals = {v for v in vals if v != olp.FACT_OTHER}
             if vals:
                 want[slot] = frozenset(want.get(slot, frozenset()) | vals)
@@ -1819,11 +2252,13 @@ def _ff_arg():
     extra = _xd_arg(xd)
     if extra:
         ff["extra"] = extra
+    if ips:
+        ff["client"] = {olp.F_IP: frozenset(ips)}
     if not ff:
         return NOFILT
     canon = sorted([by, list(name) if by == "issue" else [name], sorted([k, sorted(v)] for k, v in want.items())]
-                   for by, rows in ff.items() if by != "extra" for name, want in rows.items())
-    return json.dumps([canon, extra], ensure_ascii=False, sort_keys=True), ff
+                   for by, rows in ff.items() if by not in ("extra", "client") for name, want in rows.items())
+    return json.dumps([canon, extra, ips], ensure_ascii=False, sort_keys=True), ff
 
 
 def _xd_arg(xd):
@@ -1989,6 +2424,67 @@ def _slowest_floor(by, name, inc, exclude_db, interval, ff):
     return b.n, s[int(len(s) * (1 - 2.0 * MAX_ISSUE_LINES / b.n))]
 
 
+@app.get("/api/request_durations")
+def api_request_durations():
+    try:
+        _prepare_filter(_ff_arg())
+        return jsonify(request_durations(set(request.args.getlist("exclude_db")),
+                                         set(request.args.getlist("exclude_file")), _interval_arg(), _ff_arg()))
+    except NoData as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:                                   # a bad log must not kill the server
+        logging.getLogger("logtool").exception("request_durations failed")
+        return jsonify({"error": "%s: %s" % (type(e).__name__, e)}), 500
+
+
+@app.get("/api/cron_requests")
+def api_cron_requests():
+    """The requests that ran while one cron operation ran (see cron_requests)."""
+    name = request.args.get("name") or ""
+    if not name.startswith("cron: "):
+        return jsonify({"error": "name must be a cron operation"}), 400
+    try:
+        return jsonify(cron_requests(name, set(request.args.getlist("exclude_db")),
+                                     set(request.args.getlist("exclude_file")), _interval_arg(), _ff_arg()))
+    except NoData as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:                                   # a bad log must not kill the server
+        logging.getLogger("logtool").exception("cron_requests failed")
+        return jsonify({"error": "%s: %s" % (type(e).__name__, e)}), 500
+
+
+@app.get("/api/slowq")
+def api_slowq():
+    """One slow query's form (see slowq_detail); with running=1, what ran meanwhile (see slowq_running)."""
+    fn = slowq_running if request.args.get("running") == "1" else slowq_detail
+    try:
+        _prepare_filter(_ff_arg())
+        return jsonify(fn(request.args.get("id"), set(request.args.getlist("exclude_db")),
+                          set(request.args.getlist("exclude_file")), _interval_arg(), _ff_arg()))
+    except NoData as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:                                   # a bad log must not kill the server
+        logging.getLogger("logtool").exception("slowq failed")
+        return jsonify({"error": "%s: %s" % (type(e).__name__, e)}), 500
+
+
+@app.get("/api/op_slowq")
+def api_op_slowq():
+    """The slow queries that ran while one operation / app / type did (see op_slowq)."""
+    by, name = request.args.get("by"), request.args.get("name") or ""
+    if by not in ("operation", "app", "family") or not name:
+        return jsonify({"error": "by must be operation, app or family, with a name"}), 400
+    try:
+        _prepare_filter(_ff_arg())
+        return jsonify(op_slowq(by, name, set(request.args.getlist("exclude_db")), set(request.args.getlist("exclude_file")),
+                                _interval_arg(), _ff_arg()))
+    except NoData as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:                                   # a bad log must not kill the server
+        logging.getLogger("logtool").exception("op_slowq failed")
+        return jsonify({"error": "%s: %s" % (type(e).__name__, e)}), 500
+
+
 @app.get("/api/op_lines")
 def api_op_lines():
     """The timed lines (access lines, job messages) of one operation / app / type, re-found by re-reading the
@@ -2081,9 +2577,10 @@ def api_domain_get():
             files = [FILES[i]["name"] for i in request.args.getlist("exclude_file") if i in FILES]
         dbs = [None if d == NONE_DB else d for d in request.args.getlist("exclude_db")]
         facts = [(by, name, {k: sorted(v) for k, v in want.items()})
-                 for by, rows in (flt[1] or {}).items() if by != "extra" for name, want in rows.items()]
-        return jsonify({"domain": olp.dom_render(files, dbs, interval, facts,
-                                                 (flt[1] or {}).get("extra"), view if isinstance(view, dict) else None)})
+                 for by, rows in (flt[1] or {}).items() if by not in ("extra", "client") for name, want in rows.items()]
+        return jsonify({"domain": olp.dom_render(files, dbs, interval, facts, (flt[1] or {}).get("extra"),
+                                                 view if isinstance(view, dict) else None,
+                                                 (flt[1] or {}).get("client", {}).get(olp.F_IP, ()))})
     except (NoData, olp.DomainError) as e:
         return jsonify({"error": str(e)}), 400
     except (TypeError, KeyError, AttributeError, RecursionError) as e:       # a view of the wrong shape
@@ -2092,7 +2589,7 @@ def api_domain_get():
 
 def domain_state(text):
     """Domain text -> the app's filter state: {"exclude_file": [ids], "exclude_db": [names], "interval":
-    [from | None, to | None] | None, "ff": [...], "xd": prefix list | None, "view": {items,
+    [from | None, to | None] | None, "ip": [client addresses], "ff": [...], "xd": prefix list | None, "view": {items,
     total, bucket, fit, focus, timezone, table: {group, search, sort, hidden_columns}, errors: {level, search},
     panels_hidden}} (every view setting filled in: what the domain leaves out gets its default).
     Raises DomainError / NoData with a message for the user (or agent) to fix the domain."""
@@ -2136,10 +2633,16 @@ def domain_state(text):
     hi = min([v for op, v in parts["time"] if op == "<"] + [v + 1 for op, v in parts["time"] if op == "<="], default=None)
     if lo is not None and hi is not None and lo >= hi:
         raise NoData("the time conditions leave no time at all")
+    ips = None
+    for _, vals in parts["ip"]:                     # several ip terms: the addresses they all name
+        ips = set(vals) if ips is None else ips & set(vals)
+    if ips is not None and not ips:
+        raise NoData("the ip conditions leave no client address at all")
     return {
         "exclude_file": sorted(ex_files),
         "exclude_db": sorted(NONE_DB if d is None else d for d in ex_dbs),
         "interval": None if lo is None and hi is None else [lo, hi],
+        "ip": sorted(ips or ()),
         "ff": [{"by": by, "name": list(name) if by == "issue" else name, "facts": {k: sorted(v) for k, v in fs.items()}}
                for (by, name), fs in parts["facts"].items()],
         "xd": olp.dom_prefix(parts["extra"]) or None,
@@ -2192,6 +2695,23 @@ def api_export():
     return _attachment(json.dumps(data, indent=2, ensure_ascii=False), "application/json", "json")
 
 
+@app.get("/api/export_text")
+def api_export_text():
+    """The current selection as a plain-text report (see export_text())."""
+    try:
+        _load_pending()
+        flt = _ff_arg()
+        _prepare_filter(flt)
+        body = export_text(set(request.args.getlist("exclude_db")), set(request.args.getlist("exclude_file")),
+                           _interval_arg(), flt)
+    except NoData as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:                                   # a bad log must not kill the server
+        logging.getLogger("logtool").exception("text export failed")
+        return jsonify({"error": "%s: %s" % (type(e).__name__, e)}), 500
+    return _attachment(body, "text/plain", "txt")
+
+
 @app.get("/api/export_html")
 def api_export_html():
     """The page itself, standalone, with the current selection built in (see export_html())."""
@@ -2205,7 +2725,7 @@ def api_export_html():
         if not isinstance(view, dict) or not isinstance(view.get("items"), list):
             raise NoData("view must be the page's view settings")
         snapshot = export_html(set(request.args.getlist("exclude_db")), set(request.args.getlist("exclude_file")),
-                               _interval_arg(), _ff_arg(), _pins_arg(), view, request.args.get("desc", "")[:500])
+                               _interval_arg(), _ff_arg(), _pins_arg(), view)
         static = {}
         for name in ("style.css", "app.js"):
             with open(os.path.join(app.static_folder, name), encoding="utf-8") as fh:

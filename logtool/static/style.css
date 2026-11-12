@@ -226,6 +226,8 @@ html.nothing-loaded .group-title { background: #101112; }
 .durhist .grid { stroke: var(--line); }
 .durhist .dcol { fill: transparent; }
 .durhist g:hover .dcol { fill: rgba(255, 255, 255, .06); }
+.durhist g[data-dur] { cursor: pointer; }
+.durhist .dcol.on { fill: rgba(91, 141, 239, .18); }
 #hist text.unit { font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
 .hist-key { display: flex; flex-wrap: wrap; gap: 4px 18px; padding: 2px 6px 8px; font-size: 12.5px; min-height: 22px; }
 .key-item { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; }
@@ -544,3 +546,15 @@ tfoot .na { color: var(--dim); font-weight: normal; }
 .ll.m-during { background: #1b2a24; }
 .ll.m-during .lt { color: #b5dbb7; border-left: 3px solid #66bb6a; padding-left: 8px; }
 .ll.hit .ln { color: #ffb4ab; font-weight: bold; }
+
+/* slow queries */
+#tbl td.sqhead { max-width: 0; width: 60%; font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+pre.full.sql { max-height: 65vh; }
+.sql-kw { color: #c792ea; }
+.sql-str { color: #c3e88d; }
+.sql-num { color: #f78c6c; }
+.sql-cm { color: #697098; font-style: italic; }
+.sql-qid { color: #82aaff; }
+.sql-param { color: #ffcb6b; }
+.seg { display: inline-flex; gap: 4px; }
+.seg .btn.on { color: var(--text); border-color: var(--accent); }

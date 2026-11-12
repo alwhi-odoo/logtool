@@ -58,6 +58,7 @@ While the repository is private, cloning or installing from it needs a GitHub ac
 ```bash
 logtool                                # http://127.0.0.1:5000, then drag log files onto the page
 logtool odoo.log other.log.gz          # or preload some (plain, .gz and .bz2)
+logtool odoo.log pg_slow_queries.log   # with PostgreSQL's slow-query log (see "Slow-query logs")
 logtool --db mydb big.log              # read only database mydb's lines (see "Only read database")
 logtool --port 8080 --no-browser       # another port; do not open a browser tab
 python -m logtool                      # same as logtool
@@ -102,6 +103,11 @@ second per 15 MB), and it applies everywhere: histogram, tables, statistics, raw
 are marked *filtered*. The top bar's *item filters* button opens a table of them all, to clear one value, one
 detail or everything. The histogram's key lists them too.
 
+To follow one client through the whole report, click *only this IP* next to an address in a *client IP* table. The
+report then shows only that client's requests and the warnings and errors logged during them, with no cron jobs and
+no warnings logged outside a request. While this filter is on, the top bar shows a *Client IP: …* button. Click it to
+show every client again.
+
 The whole page state can also be read and written as one Odoo-style domain: *General Info → Filter editor*.
 Besides the filters above, it takes any condition on requests, jobs and warnings (`["http_status", ">=", 500]`,
 `["duration", ">", 2]`, `["level", "=", "ERROR"]`, ...) and every view setting: the histogram's items, series,
@@ -141,8 +147,17 @@ was logged during.
 
 *Histogram* (operations, apps and types) shows how long their calls took: the number of calls per span of
 milliseconds, the spans growing evenly on a log scale (…, 10, 15, 20, 30, 50, 70, 100 ms, …) so quick and slow calls
-both show, with the average and p95 marked. It follows the selection, time interval and filters like the rest of the
-form. Past 20,000 calls of one operation the counts are estimated from a sample of them.
+both show, with the average, median and p95 marked. It follows the selection, time interval and filters like the rest of the
+form. Click a bar to add an item filter keeping only the calls in that span (*duration ms*), click it again to remove it.
+While it is on, the bars still count every call, the spans kept highlighted, so more spans can be added. Past 20,000 calls of one operation the counts are estimated from a sample of them.
+
+*Requests during runs* (cron jobs only) lists the requests that ran while the cron job ran: those whose span (their
+end less their duration) overlaps one of its runs, to the second. Its sheet shows their average time, and the tab
+shows the same histogram of them, with their average and the average of every request of the selection marked.
+They are re-found by reading the log again, like raw lines.
+
+The *Request time* statistic's *Histogram* button shows that histogram for every request of the selection, with the
+average marked.
 
 *Raw log lines* lists the operation's own lines (in log order or slowest first) or the message's occurrences.
 Click one to see the lines around it in the file, color coded: the occurrence itself, other occurrences of the
@@ -159,6 +174,39 @@ The *Logged during* tab of an operation, app or type also lists the users and re
 the requests that named it. For example, filter `call_button sale.order.action_confirm` by `sale.order(42)`: its
 client IPs then show who confirmed order 42.
 
+## Slow-query logs
+
+PostgreSQL's slow-query logs (`pg_slow_queries.log`) load like any log: drop them on the page, alone or beside the
+Odoo logs. A file is one when its name says so (`slow_quer…`) or when its first lines are entries:
+
+```
+--------------------------------------------------------------------------------
+2026-11-10 17:24:10.365 UTC my_db: approximate duration: 41 seconds
+
+SELECT ...
+```
+
+Each entry is one query: logged at that time (UTC, the same clock as the Odoo logs), in that database, after
+running that many seconds. Its SQL is kept as text, up to 100,000 characters. Runs of the same query with other
+values share a *shape*: the SQL with every literal replaced by `?` and lists of values folded into one.
+
+* They follow the selection: files, databases (each query counts as one line of its database), time interval (by
+  when it was logged) and the filter editor (kind `slow_query`, fields `duration` and `sql`; see FILTERS.md).
+  Item filters leave them alone, and *only this IP* drops them (a query has no client).
+* *General Info* counts them; its *List* button shows them in the table, grouped **By slow query**: one row per
+  shape (the 5,000 with the most time), with when its last run was logged, its database, its runs, their total,
+  average and longest time, and its SQL with `?` for the literals. Sort by any column, search the SQL and database.
+* **Click** a row for the page of its longest run: the SQL highlighted (*Formatted* lays it out one clause per line, *As logged*
+  keeps it as written, *Copy*), *Same shape* (the runs of its shape: their numbers, durations histogram and list)
+  and *Running at the same time* (the requests and jobs of its database whose run overlapped it).
+* **Right-click** a row (or *Select* on a query's page) to plot the runs of its shape on the histogram, as occurrences,
+  average ms or total ms.
+* An operation, app or type's *Logged during* tab lists the slow queries that overlapped its calls, one row per
+  shape (its overlapping runs, their time and how many calls they overlap).
+
+Slow-query logs name no worker, so a query is matched to the requests and jobs that ran meanwhile by time (to the
+second) and database only: it may belong to another one that ran at the same time.
+
 ## Export summary
 
 *Export summary* downloads a JSON copy of the selection to share. It has no database names, file names or raw
@@ -171,6 +219,7 @@ file widely.
 Besides the tables, it has every distinct warning / error, the details behind each row, a timeline per cron /
 automation rule, per-client activity over time, the logins, the lines per log level, and `limits`: what this
 particular log cannot show (no DEBUG lines, no session per request, ...). `fields` explains each key.
+Slow queries are counted (`slow_queries`: by shape and the longest runs) without their SQL.
 *Import summary* opens one again, read-only.
 
 ## Export HTML
@@ -187,7 +236,24 @@ It opens read-only: sorting, filtering and grouping the tables, chart items, buc
 picking another database or time interval, focus, item filters, the filter editor and raw log lines do not. With a
 time interval (or a focus) the histogram shows just that span, at the finer bucket sizes of *Focus interval*. The
 details popup is kept for the top 100 operations, every cron, automation and module-loading operation, and the top
-50 apps, types and errors.
+50 apps, types and errors, and for the longest run of the 100 slow-query shapes with the most time, whose SQL has
+every literal replaced by `?`. The filter itself stays out of the file. The page only says which kinds of filter are on
+and how many, and the table and errors search boxes are emptied.
+
+## Export text
+
+*Export text* downloads the current selection as a plain-text report in three parts, separated by `=====` lines:
+
+1. an ASCII histogram of the requests, one line per bucket (at most 60);
+2. every operation with its calls and average ms, each followed by its *Details behind the grouping* (except the
+   client IPs, which are left out of the file but still filter), then the slow queries, one line per shape (runs,
+   total, average and longest time; not their SQL);
+3. every occurrence's own log line, marked `>`, with the 3 lines before and after it, oldest first.
+
+It holds one database and the lines without one (*None*). While two databases are selected, the button is disabled.
+The raw lines are only the selected database's own: the other databases' lines and the lines without a database are
+skipped, both as occurrences and as context. Nothing is censored, so the file holds raw log lines. It grows to about
+three times the size of the log it covers.
 
 ## Performance
 

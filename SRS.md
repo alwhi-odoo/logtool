@@ -194,7 +194,8 @@ versions. Requirements on it:
 #### 3.1.4 Files
 
 * **FR-IO-1** Input: Odoo log files, plain text (any line ending, invalid UTF-8 replaced), gzip (`.gz`) or bzip2
-  (`.bz2`), chosen by file suffix; exported summaries (`.json`).
+  (`.bz2`), chosen by file suffix; PostgreSQL slow-query logs (Appendix A), recognised by their name or first
+  lines; exported summaries (`.json`).
 * **FR-IO-2** Output: the export summary (JSON); `logtool-report` text, CSV and JSON.
 
 ### 3.2 Functional requirements
@@ -308,6 +309,9 @@ versions. Requirements on it:
   level filter and search.
 * **FR-VIEW-6** Right-clicking a row shall select it: it becomes a histogram item and a row of the selected items
   table.
+* **FR-VIEW-7** Slow queries shall follow the file, database and time-interval selection and the domain (kind
+  `slow_query`). The table shall list them *By slow query*, one row per shape (the runs of one query, literals aside;
+  the 5,000 with the most time), sortable and searchable; right-clicking one shall select it as a histogram item.
 
 #### 3.2.7 Detail pages (FR-DET)
 
@@ -316,6 +320,9 @@ versions. Requirements on it:
   logged while it ran and the users / records they name, and its raw lines.
 * **FR-DET-2** Opening an issue shall show its numbers, details, the operations it was logged during and its
   occurrences.
+* **FR-DET-6** Opening a slow query shall show its SQL highlighted (laid out, or as logged), the runs of its shape
+  and the requests and jobs of its database that overlapped it. An operation, app or type's lines logged during it
+  shall include the slow queries that overlapped its calls, matched by time and database.
 * **FR-DET-3** Raw lines shall be listed in log order, or slowest first for operations, up to 200, honoring the
   selection and every filter; they shall be re-read from the files in parallel, only over the chunks that overlap
   the interval.
@@ -462,6 +469,16 @@ Access lines:
 | 17.0 – 19.0 | `werkzeug` | `ip - - [date] "GET /x HTTP/1.1" 200 - 91 0.412 0.663` |
 | 19.4 – 20.0 | `odoo.http.server` | `ip SESSION - [date] "GET /x HTTP/1.1" 200 7454 91 0.412 0.663 rw` |
 
+PostgreSQL slow-query logs: entries separated by a line of dashes, each a header followed by its SQL (any number
+of lines, kept up to 100,000 characters):
+
+```
+--------------------------------------------------------------------------------
+2026-11-10 17:24:10.365 UTC my_db: approximate duration: 41 seconds
+
+SELECT ...
+```
+
 ## Appendix B. Fixed limits
 
 | limit | value |
@@ -497,6 +514,8 @@ Access lines:
 | `GET /api/op_lines` | raw lines of an operation / app / type (`order=slow` for slowest first) |
 | `GET /api/issue_lines` | occurrences of an issue |
 | `GET /api/issue_context` | lines around one occurrence |
+| `GET /api/slowq` | a slow query's page (`id`); with `running=1`, the requests and jobs that overlapped it |
+| `GET /api/op_slowq` | the slow queries that overlapped an operation / app / type's calls (`by`, `name`) |
 | `GET /api/domain`, `POST /api/domain` | the page state as a domain; check and apply a domain (`{"domain": "..."}`) |
 | `GET /api/export` | the export summary (attachment) |
 | `GET /api/export_html` | the standalone HTML page of the selection (attachment; `view`, `pins`, `desc`) |

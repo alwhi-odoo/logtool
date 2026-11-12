@@ -27,13 +27,16 @@ const state = {
     // and pinned errors / warnings [{level, logger, message, label, bars, lines, hue}]; bars / lines: Sets of SERIES keys
     histTags: [],
     issueTags: [],
+    sqTags: [],                          // pinned slow-query shapes [{shape, label, bars, lines, hue}]
     totalSeries: {bars: new Set(["req"]), lines: new Set(["avg_all"])},   // what the "total" item plots
     histSize: "auto",                   // bucket size in minutes; "auto" = 10 min (or ~200 bars when focused)
     focus: null,                         // "Focus interval": {from, to} in unix seconds, the only span the chart shows
     focusHist: null,                     // ... and its timeline, at the finer resolution the server sends for it
     factFilters: [],                     // values picked in the details behind a row (see toggleFact)
     extraDomain: null,                   // the rest of the filter editor's domain: a prefix list the server evaluates per occurrence
-    tableGroup: ["operation", "app", "family"].includes(store.get("tableGroup")) ? store.get("tableGroup") : "operation",
+    ips: [],                             // client addresses the whole report is narrowed to (the domain's "ip", see setIps)
+    tableGroup: ["operation", "app", "family", "slowq"].includes(store.get("tableGroup")) ? store.get("tableGroup") : "operation",
+    sqSort: {key: "total_s", dir: -1},   // the slow-query table's own sort (its columns are not the operations')
     issueLevel: "all",
     issueFilter: "",
     histFit: store.get("histFit", true),    // squeeze every bucket into the panel width instead of scrolling
@@ -188,10 +191,10 @@ function snapApi(url) {
     // the path is read from the request itself, never resolved against the page's own address: on Windows that is
     // file:///C:/..., which would turn "/api/analyze" into "/C:/api/analyze"
     const [path, query] = url.split("?"), q = new URLSearchParams(query);
-    const key = path === "/api/issue_detail" ? ["issue", q.get("level"), q.get("logger"), q.get("msg")] : [q.get("by"), q.get("name")];
+    const key = path === "/api/issue_detail" ? ["issue", q.get("level"), q.get("logger"), q.get("msg")] : path === "/api/slowq" ? ["slowq", q.get("id")] : [q.get("by"), q.get("name")];
     if (path === "/api/analyze") return structuredClone(SNAP.analyze);
     if (path === "/api/timeline" && SNAP.focus) return structuredClone(SNAP.focus);
-    if (["/api/detail", "/api/issue_detail"].includes(path) && SNAP.details[key.join("\x1f")]) return SNAP.details[key.join("\x1f")];
+    if (["/api/detail", "/api/issue_detail", "/api/slowq"].includes(path) && SNAP.details[key.join("\x1f")]) return SNAP.details[key.join("\x1f")];
     throw new Error("not in this HTML export, which carries the details of the busiest rows of each table and of every cron, automation and module-loading operation only");
 }
 
@@ -212,7 +215,7 @@ async function refresh() {                       // files changed: reload the li
         analyzeSeq++;
         busy("analyze");
         Object.assign(state, {data: null, dbInit: false, interval: null, anchor: null, rowsAll: null, rowsKey: null, focus: null, focusHist: null,
-            factFilters: [], extraDomain: null, histTags: [], issueTags: [], totalSeries: defaultSeries("total")});
+            factFilters: [], extraDomain: null, ips: [], histTags: [], issueTags: [], sqTags: [], totalSeries: defaultSeries("total")});
         focusSeq++;
         busy("focus");
         renderFfButton();
@@ -234,6 +237,7 @@ function selectionParams() {                      // the file -> database -> tim
     if (state.interval) { p.set("from", state.interval.from); p.set("to", state.interval.to); }
     if (state.factFilters.length) p.set("ff", JSON.stringify(state.factFilters));
     if (state.extraDomain) p.set("xd", JSON.stringify(state.extraDomain));
+    state.ips.forEach(ip => p.append("ip", ip));
     return p;
 }
 
@@ -264,7 +268,6 @@ function exportHtml() {
     const p = selectionParams();
     if (pinsParam()) p.set("pins", pinsParam());
     p.set("view", JSON.stringify(viewState()));
-    p.set("desc", filterParts(false).join(" · "));
     return exportAs("/api/export_html?" + p, "logtool-export.html");
 }
 
@@ -295,6 +298,7 @@ async function analyzeNow() {
             state.interval = j.interval ? {from: j.interval[0], to: j.interval[1]} : null;
         state.data = j;
         state.files = j.files;
+        for (const t of state.sqTags) if (sqData().labels[t.shape]) t.label = sqLabel(sqData().labels[t.shape]);   // a domain names shapes by id only
         // the server picks the databases on the first load and when every selected one has gone away
         if (!state.dbInit || j.excluded_db.join("\n") !== [...sent].sort().join("\n")) state.excluded = new Set(j.excluded_db);
         const known = new Set(j.databases.map(d => d[0]));
@@ -378,8 +382,8 @@ async function resetAll() {
         await api("/api/reset", {method: "POST"});
         try { Object.keys(localStorage).filter(k => k.startsWith("logtool.")).forEach(k => localStorage.removeItem(k)); } catch (e) { /* private mode */ }
         Object.assign(state, {
-            anchor: null, interval: null, filter: "", histTags: [], issueTags: [], histSize: "auto", histFit: true,
-            totalSeries: {bars: new Set(["req"]), lines: new Set(["avg_all"])}, focus: null, focusHist: null, factFilters: [], extraDomain: null,
+            anchor: null, interval: null, filter: "", histTags: [], issueTags: [], sqTags: [], histSize: "auto", histFit: true,
+            totalSeries: {bars: new Set(["req"]), lines: new Set(["avg_all"])}, focus: null, focusHist: null, factFilters: [], extraDomain: null, ips: [],
             tableGroup: "operation", issueLevel: "all", issueFilter: "", sort: {key: "total_s", dir: -1},
             hidden: {hist: false, table: false, issues: false, sel: false}, tz: "UTC",
         });
@@ -536,7 +540,20 @@ function renderFiles() {
     resetDropText();
 }
 
+// Export text holds one database and the lines without one (see export_text in app.py)
+const TXT_TIP = "Downloads the current selection as a plain-text report: the requests histogram, every operation with " +
+    "its calls, average time and the details behind it, then each occurrence's log line with the 3 lines before and after it, oldest first. " +
+    "Its raw lines are the selected database's own: lines of other databases and lines without one are never in it.";
+function renderExportTxt() {
+    const b = $("#exportTxtBtn"), dbs = state.data ? state.data.databases : [];
+    b.hidden = !state.data || state.data.imported;
+    const many = dbs.filter(d => d[0] !== "-" && !state.excluded.has(d[0])).length > 1;
+    b.disabled = many;
+    b.dataset.tip = many ? "Export text holds one database (and the lines without one): select only one database to export." : TXT_TIP;
+}
+
 function renderDbs() {
+    renderExportTxt();
     const box = $("#dbs"), dbs = state.data ? state.data.databases : [];
     if (!dbs.length) {
         box.innerHTML = `<span class="sub">${state.data && state.data.imported ? "Not saved in an imported summary."
@@ -717,6 +734,9 @@ function renderAll() {
     $("#histPanel").hidden = !has || !state.data.hist_key;                       // no per-minute data in an older import
     $("#exportBtn").hidden = $("#exportHtmlBtn").hidden = !has || state.data.imported;   // re-exporting an import would just hand back what it already is
     $("#selPanel").hidden = !has || !pickedCount();
+    const hasSq = state.files.some(f => f.kind === "slowq") || sqData().n > 0;   // the slow-query view only once such a log is loaded
+    $('#tableGroup option[value="slowq"]').hidden = !hasSq;
+    if (!hasSq && state.tableGroup === "slowq") $("#tableGroup").value = state.tableGroup = "operation";
     hideTip();                                                                     // its element is about to be replaced
     if (!has) return;
     try {
@@ -733,9 +753,9 @@ function renderAll() {
 
 const view = () => state.data.view;
 
-function stat(k, v, s, tipText, cls) {
+function stat(k, v, s, tipText, cls, extra) {
     return `<div class="stat ${cls || ""}"${tipText ? ` data-tip="${esc(tipText)}"` : ""}>` +
-        `<span class="k">${k}</span><span class="v">${v}</span><span class="s">${s || "&nbsp;"}</span></div>`;
+        `<span class="k">${k}</span><span class="v">${v}</span><span class="s">${s || "&nbsp;"}</span>${extra || ""}</div>`;
 }
 
 // HTTP status: a colored code badge followed by its request count
@@ -771,7 +791,8 @@ function renderStats() {
             "Recognized log formats: " + ((s.formats || []).map(([k, n]) => `${esc(k)} (${nf0.format(n)})`).join("; ") || "none") +
                 (s.held_n ? `. ${nf0.format(s.held_n)} WebSocket / long-poll connections were held open for ${fDur(s.held_s)} in total; that is waiting, so it is not counted as processing time.` : "")) +
         stat("Request time", fDur(s.request_s), share(s.request_s, full.req_total_s) || `${nf0.format(s.request_s)} s across all workers`,
-            "Sum of SQL + Python time of every HTTP request. Can exceed the window because workers run in parallel.") +
+            "Sum of SQL + Python time of every HTTP request. Can exceed the window because workers run in parallel.",
+            "filtercard", state.data.imported || SNAP || !s.requests ? "" : `<button class="btn ghost" id="reqHistOpen">Histogram</button>`) +
         (s.jobs ? stat("Background jobs", fDur(s.jobs_s), `${nf0.format(s.jobs)} runs · ${fPct(s.total_s ? 100 * s.jobs_s / s.total_s : 0)} of all time`,
             "Cron jobs, automation rules and module loading, timed from their log messages. They are part of the table totals but have no SQL / Python split.") : "") +
         `<div class="stat" data-tip="Time inside PostgreSQL vs everything else."><span class="k">SQL / Python</span>` +
@@ -780,20 +801,37 @@ function renderStats() {
         `<span class="s"><span class="legend-dot" style="background:#5b8def"></span>SQL ${fDur(s.sql_s)} ` +
         `<span class="legend-dot" style="background:#e6a35a"></span>Py ${fDur(s.python_s)}</span></div>` +
         stat("SQL queries", nf0.format(s.queries), s.requests ? nf1.format(s.queries / s.requests) + " per request" : "") +
+        (sqData().n ? stat("Slow queries", nf0.format(sqData().n), `${fDur(sqData().total_s)} in all · longest ${fDur(sqData().max_s)} · ${plural(sqData().shapes, "shape")}`,
+            "Queries of the PostgreSQL slow-query logs logged in the selection. Runs of one query with other values share a shape.",
+            "filtercard", `<button class="btn ghost" id="sqOpen">List</button>`) : "") +
         errorsCard(s, v.levels, errPct) +
         stat("Operations", nf0.format(s.operations), `${nf0.format(s.apps)} apps · ${nf0.format(s.types)} types`, "Distinct operations, Odoo apps and work types in the current selection.") +
         statusCard(s.status || []) + filterCard() +
         (s.untimed ? stat("Untimed requests", nf0.format(s.untimed), "no timing data (older Odoo); counted as 0 s") : "");
 }
 
+// the "Request time" statistic's popup: how long the requests of the selection took, their average marked
+let reqHistSeq = 0;
+function openReqHist() {
+    const seq = ++reqHistSeq, s = view().stats, avg = s.requests ? 1000 * s.request_s / s.requests : null;
+    $("#reqHistBody").innerHTML = `<div class="sub loading">Loading…</div>`;
+    $("#reqHistModal").hidden = false;
+    api("/api/request_durations?" + selectionParams()).then(d => {
+        if (seq === reqHistSeq) $("#reqHistBody").innerHTML = durHist(d.durations, avg === null ? [] : [["avg", avg, TONE.avg_ms]], "requests");
+    }).catch(e => {
+        if (seq === reqHistSeq) $("#reqHistBody").innerHTML = `<div class="sub err">Could not load the histogram: ${esc(e.message)}</div>`;
+    });
+}
+
 /* ---- filter editor: the whole global filter as an Odoo-style domain (see FILTERS.md) ---------------- */
 const plural = (n, one, many) => `${nf0.format(n)} ${n === 1 ? one : many || one + "s"}`;
 const domTerms = d => (d || []).filter(x => Array.isArray(x)).length;
-function filterParts(sources = true) {          // sources: also the files and databases left out
+function filterParts() {
     const parts = [], nf = state.factFilters.reduce((n, f) => n + Object.values(f.facts).reduce((m, v) => m + v.length, 0), 0);
-    if (sources && state.excludedFiles.size) parts.push(plural(state.excludedFiles.size, "file") + " left out");
-    if (sources && state.excluded.size) parts.push(plural(state.excluded.size, "database") + " left out");
+    if (state.excludedFiles.size) parts.push(plural(state.excludedFiles.size, "file") + " left out");
+    if (state.excluded.size) parts.push(plural(state.excluded.size, "database") + " left out");
     if (state.interval) parts.push("time interval");
+    if (state.ips.length) parts.push("client IP " + state.ips.join(", "));
     if (nf) parts.push(plural(nf, "item filter"));
     if (state.extraDomain) parts.push(plural(domTerms(state.extraDomain), "custom condition"));
     return parts;
@@ -815,15 +853,16 @@ const SERIES_INTERNAL = Object.fromEntries(Object.entries(SERIES_PUBLIC).map(([k
 const PANEL_PUBLIC = {hist: "chart", table: "table", sel: "selected", issues: "errors"};
 const pubSeries = set => SERIES.map(x => x.key).filter(k => set.has(k)).map(k => SERIES_PUBLIC[k]);
 const intSeries = list => new Set((list || []).map(x => SERIES_INTERNAL[x]).filter(Boolean));
-const pubCol = k => k === "family" ? "type" : k;
-const intCol = k => k === "type" ? "family" : k;
+const pubCol = k => k === "family" ? "type" : k === "slowq" ? "slow_query" : k;
+const intCol = k => k === "type" ? "family" : k === "slow_query" ? "slowq" : k;
 
 // everything the page shows besides the filter itself, in the shape the server writes as view settings
 function viewState() {
     const cols = new Set(COLS.filter(c => c.cls !== "op").map(c => c.key));
     return {
         items: state.histTags.map(t => Object.assign(t.by ? {[pubCol(t.by)]: t.term} : {search: t.label}, {bars: pubSeries(t.bars), lines: pubSeries(t.lines)}))
-            .concat(state.issueTags.map(t => ({issue: [t.level, t.logger, t.message], bars: pubSeries(t.bars).filter(x => x === "requests"), lines: pubSeries(t.lines).filter(x => x === "requests")}))),
+            .concat(state.issueTags.map(t => ({issue: [t.level, t.logger, t.message], bars: pubSeries(t.bars).filter(x => x === "requests"), lines: pubSeries(t.lines).filter(x => x === "requests")})))
+            .concat(state.sqTags.map(t => ({slow_query: t.shape, bars: pubSeries(t.bars), lines: pubSeries(t.lines)}))),
         total: {bars: pubSeries(state.totalSeries.bars), lines: pubSeries(state.totalSeries.lines)},
         bucket: state.histSize === "auto" ? "auto" : +state.histSize,
         fit: !!state.histFit,
@@ -845,8 +884,14 @@ function validTz(z) {
 function applyView(v) {
     state.histTags = [];
     state.issueTags = [];
+    state.sqTags = [];
     for (const it of v.items) {
         const series = {bars: intSeries(it.bars), lines: intSeries(it.lines)};
+        if (it.slow_query) {
+            if (!isSqPicked(it.slow_query))
+                state.sqTags.push(Object.assign({shape: it.slow_query, label: sqLabel(sqData().labels[it.slow_query] || it.slow_query)}, series, {hue: nextHue()}));
+            continue;
+        }
         if (it.issue) {
             const [level, logger, message] = it.issue;
             if (!state.issueTags.some(t => sameIssue(t, {level, logger, message})))
@@ -909,6 +954,7 @@ function describeDomainState(st) {
     if (st.exclude_file.length) parts.push(plural(st.exclude_file.length, "file") + " left out");
     if (st.exclude_db.length) parts.push(plural(st.exclude_db.length, "database") + " left out");
     if (st.interval) parts.push("time interval");
+    if (st.ip.length) parts.push("client IP " + st.ip.join(", "));
     if (st.ff.length) parts.push(plural(st.ff.length, "item") + " with item filters");
     if (st.xd) parts.push(plural(domTerms(st.xd), "custom condition") + " (checked on every request, job and warning)");
     const v = st.view, view = [plural(v.items.length, "chart item"), v.bucket === "auto" ? "auto buckets" : fSize(v.bucket) + " buckets"];
@@ -958,6 +1004,7 @@ async function applyDomain() {
     state.excluded = new Set(st.exclude_db);
     state.factFilters = st.ff;
     state.extraDomain = st.xd;
+    state.ips = st.ip;
     state.anchor = null;
     if (st.interval && w) {
         const from = st.interval[0] ?? w[0], to = st.interval[1] ?? w[1];
@@ -984,8 +1031,8 @@ $("#domText").addEventListener("keydown", e => {
     }
 });
 
-const GROUP_LABEL = {family: "type", app: "app", operation: "operation"};
-const GROUP_UNIT = {family: "types", app: "apps", operation: "operations"};
+const GROUP_LABEL = {family: "type", app: "app", operation: "operation", slowq: "slow query"};
+const GROUP_UNIT = {family: "types", app: "apps", operation: "operations", slowq: "distinct slow queries"};
 const groupName = (r, by) => by === "family" ? r.family : by === "app" ? r.app : r.operation;
 
 /* ---- requests over time -------------------------------------------------
@@ -1017,16 +1064,17 @@ const UNIT_LABEL = {req: "requests", avg: "avg ms", tot: "total ms"};
 const GROUP_LABEL_S = {avg: "average ms", tot: "total ms"};
 const COMP_LABEL = {all: "", py: " · py", sql: " · sql"};
 // an error / warning only has occurrences: no processing time of its own
-const seriesAllowed = (it, key) => it.kind !== "issue" || key === "req";
-const seriesName = (it, s) => s.key === "req" ? (it.kind === "issue" ? "occurrences" : "requests") : GROUP_LABEL_S[s.group] + COMP_LABEL[s.comp];
-const unitLabel = (u, items) => u === "req" && items.length && items.every(i => i.kind === "issue") ? "occurrences" : UNIT_LABEL[u];
+// an error / warning only has occurrences; a slow query, occurrences and the time they ran (not split into SQL / Python)
+const seriesAllowed = (it, key) => it.kind === "issue" ? key === "req" : it.kind === "slowq" ? ["req", "avg_all", "tot_all"].includes(key) : true;
+const seriesName = (it, s) => s.key === "req" ? (it.kind === "issue" || it.kind === "slowq" ? "occurrences" : "requests") : GROUP_LABEL_S[s.group] + COMP_LABEL[s.comp];
+const unitLabel = (u, items) => u === "req" && items.length && items.every(i => i.kind === "issue" || i.kind === "slowq") ? "occurrences" : UNIT_LABEL[u];
 // one hue per item; a series is a shade of it, and lines are dashed by what they measure
 const SHADE = {req: [0, 0], avg_all: [0, 16], avg_py: [34, 18], avg_sql: [-34, 8], tot_all: [0, -16], tot_py: [34, -8], tot_sql: [-34, -22]};
 const seriesColor = (hue, key) => `hsl(${(hue + SHADE[key][0] + 360) % 360} 60% ${60 + SHADE[key][1]}%)`;
 const DASH = {avg: "", tot: "7 4", req: "2 3"};
 const ITEM_HUES = [190, 20, 100, 330, 45, 215, 150, 300, 0, 75, 240, 165];
 const TOTAL_HUE = 270;
-const defaultSeries = kind => ({bars: new Set(["req"]), lines: new Set(kind === "issue" ? [] : ["avg_all"])});
+const defaultSeries = kind => ({bars: new Set(["req"]), lines: new Set(kind === "issue" || kind === "slowq" ? [] : ["avg_all"])});
 
 const pad2 = n => String(n).padStart(2, "0");
 const fSize = m => m < 60 ? m + " min" : m < 1440 ? m / 60 + " h" : m === 1440 ? "1 day" : m / 1440 + " days";
@@ -1041,13 +1089,14 @@ function niceMax(m) {
 function histItems() {
     return [{id: "total", kind: "total", label: "total", cfg: state.totalSeries, hue: TOTAL_HUE}]
         .concat(state.histTags.map((t, i) => ({id: "t" + i, kind: "tag", tag: t, label: t.label, cfg: t, hue: t.hue})))
-        .concat(state.issueTags.map((t, i) => ({id: "i" + i, kind: "issue", tag: t, label: t.label, cfg: t, hue: t.hue})));
+        .concat(state.issueTags.map((t, i) => ({id: "i" + i, kind: "issue", tag: t, label: t.label, cfg: t, hue: t.hue})))
+        .concat(state.sqTags.map((t, i) => ({id: "q" + i, kind: "slowq", tag: t, label: t.label, cfg: t, hue: t.hue})));
 }
 const itemById = id => histItems().find(it => it.id === id);
-const pickedCount = () => state.histTags.length + state.issueTags.length;
+const pickedCount = () => state.histTags.length + state.issueTags.length + state.sqTags.length;
 function nextHue() {
-    const used = new Set([...state.histTags, ...state.issueTags].map(t => t.hue));
-    return ITEM_HUES.find(h => !used.has(h)) ?? ITEM_HUES[(state.histTags.length + state.issueTags.length) % ITEM_HUES.length];
+    const used = new Set([...state.histTags, ...state.issueTags, ...state.sqTags].map(t => t.hue));
+    return ITEM_HUES.find(h => !used.has(h)) ?? ITEM_HUES[pickedCount() % ITEM_HUES.length];
 }
 // pinned items the current data has nothing for, though they may well be in the selection (outside its top N)
 function missingPins() {
@@ -1119,28 +1168,30 @@ function binHist(packs, size) {
 function histBuckets() {
     const h = histData(), size = histSize();
     const {map: allMap, total} = binHist([h.all], size);
+    // an error's own timeline: the focused one when focused, else the current view's (looked up fresh
+    // each render, so it never goes stale when the interval or the exclusions change); a slow-query shape's,
+    // its runs in the current view, one [minute, 1, seconds, 0, 0] each
+    const issueRows = state.focus && state.focusHist ? state.focusHist.issues || [] : (state.data && view().issues) || [];
+    const maps = histItems().map(it => {
+        let packs;
+        if (it.kind === "total") packs = [h.all];
+        else if (it.kind === "tag") packs = histOps(h).filter(r => tagMatcher(it.tag)(r)).map(r => r.hist);
+        else if (it.kind === "slowq") packs = [((sqData().rows.find(r => r.shape === it.tag.shape) || {}).runs || []).map(([t, s]) => [Math.floor(t / 60), 1, s, 0, 0])];
+        else { const row = issueRows.find(r => sameIssue(r, it.tag)); packs = row ? [row.hist] : []; }
+        return binHist(packs, size).map;
+    });
     let k0 = null, k1 = null;
     if (state.focus) {                                                   // the focused span, empty buckets included
         k0 = Math.floor(state.focus.from / 60 / size) * size;
         k1 = Math.floor((Math.ceil(state.focus.to / 60) - 1) / size) * size;
-    } else if (allMap.size) {
-        const keys = [...allMap.keys()];
-        k0 = Math.min(...keys);
-        k1 = Math.max(...keys);
+    } else {                                                             // no request at all (slow-query logs alone): the items' span
+        const keys = allMap.size ? [...allMap.keys()] : maps.flatMap(m => [...m.keys()]);
+        if (keys.length) { k0 = Math.min(...keys); k1 = Math.max(...keys); }
     }
     const keys = [];
     if (k0 !== null) for (let k = k0; k <= k1; k += size) keys.push(k);
     const align = map => keys.map(k => [k, map.get(k) || [0, 0, 0, 0]]);
-    // an error's own timeline: the focused one when focused, else the current view's (looked up fresh
-    // each render, so it never goes stale when the interval or the exclusions change)
-    const issueRows = state.focus && state.focusHist ? state.focusHist.issues || [] : (state.data && view().issues) || [];
-    const items = histItems().map(it => {
-        let packs;
-        if (it.kind === "total") packs = [h.all];
-        else if (it.kind === "tag") packs = histOps(h).filter(r => tagMatcher(it.tag)(r)).map(r => r.hist);
-        else { const row = issueRows.find(r => sameIssue(r, it.tag)); packs = row ? [row.hist] : []; }
-        return Object.assign({}, it, {list: align(binHist(packs, size).map)});
-    });
+    const items = histItems().map((it, i) => Object.assign({}, it, {list: align(maps[i])}));
     return {keys, size, total, items};
 }
 
@@ -1573,11 +1624,13 @@ function rowHtml(r, by, cols, denom) {
 function setTableCount(T) {
     $(T.count).textContent = `${nf0.format(T.rows.length)} of ${nf0.format(T.total)} ${GROUP_UNIT[T.by]}` +
         (T.id === "main" && T.by === "operation" && T.total >= 5000 ? " (top 5,000 by time)" : "") +
+        (T.by === "slowq" ? ` · ${plural(sqData().n, "run")}` + (T.total > sqData().rows.length ? ` (the ${nf0.format(sqData().rows.length)} with the most time)` : "") : "") +
         (T.shown < T.rows.length ? ` · showing ${nf0.format(T.shown)}, scroll for more` : "");
 }
 
 // bodyOnly: only the rows changed (search box); otherwise header, rows and totals are rebuilt
 function renderOpTable(T, bodyOnly) {
+    if (state.tableGroup === "slowq") return renderSqTable(T, bodyOnly);
     const v = view(), by = state.tableGroup, {key, dir} = state.sort;
     const q = T.id === "main" ? state.filter.trim().toLowerCase() : "";
     const base = sortedRows(T, v, by, key, dir);
@@ -1603,6 +1656,10 @@ function renderOpTable(T, bodyOnly) {
 }
 
 function renderTable(bodyOnly) {
+    const sq = state.tableGroup === "slowq";
+    $("#tableTitle").textContent = sq ? "Slow queries" : "Top operations";
+    $("#filter").placeholder = sq ? "Filter (SQL or database)…" : "Filter (type, app or operation)…";
+    $("#colsBtn").hidden = sq;
     if (!state.hidden.table) renderOpTable(TABLES.main, bodyOnly);
     renderSelTable();
 }
@@ -1616,6 +1673,10 @@ function selItemRow(it) {
         return Object.assign(t, {avg_ms: t.calls ? 1000 * t.total_s / t.calls : 0, queries_per_call: t.calls ? t.queries / t.calls : 0, p95_s: null});
     };
     if (it.kind === "issue") return v.issues.find(r => sameIssue(r, it.tag)) || null;
+    if (it.kind === "slowq") {
+        const r = sqData().rows.find(x => x.shape === it.tag.shape);
+        return r ? {calls: r.n, total_s: r.total_s, avg_ms: 1000 * r.avg_s, max_s: r.max_s, sq: true} : null;
+    }
     if (!it.tag.by) { const rows = opRows().filter(tagMatcher(it.tag)); return rows.length ? sum(rows) : null; }
     return detailRow(it.tag.by, it.tag.term) || null;
 }
@@ -1628,13 +1689,15 @@ function renderSelTable() {
     $("#selCount").textContent = plural(items.length, "item");
     const rows = items.map(it => {
         const r = selItemRow(it), issue = it.kind === "issue";
-        const kind = issue ? (it.tag.level === "WARNING" ? "warning" : "error") : it.tag.by ? GROUP_LABEL[it.tag.by] : "search";
+        const kind = issue ? (it.tag.level === "WARNING" ? "warning" : "error") : it.kind === "slowq" ? "slow query" : it.tag.by ? GROUP_LABEL[it.tag.by] : "search";
         const label = issue ? it.tag.message : it.tag.label;
         const name = `<td class="op l"><span class="sw-item" style="background:${seriesColor(it.hue, "req")}"></span>` +
             `<span class="badge b-mixed selkind">${esc(kind)}</span> ${esc(label)}${issue ? ffBadge("issue", issueKeyOf(it.tag)) : it.tag.by ? ffBadge(it.tag.by, it.tag.term) : ""}</td>`;
         const attrs = `data-sel-item="${it.id}"`;
         if (!r) return `<tr ${attrs}>${name}<td class="empty-cell" colspan="9">not in the current selection</td></tr>`;
         if (issue) return `<tr ${attrs}>${name}<td style="color:${TONE.calls}">${nf0.format(r.n)}</td>${dash.repeat(8)}</tr>`;
+        if (r.sq) return `<tr ${attrs}>${name}<td style="color:${TONE.calls}">${nf0.format(r.calls)}</td><td>${fSec(r.total_s)}</td>${dash}` +
+            `<td style="color:${TONE.avg_ms}">${nf0.format(r.avg_ms)}</td>${dash.repeat(3)}<td>${fSec(r.max_s)}</td>${dash}</tr>`;
         return `<tr ${attrs}>${name}<td style="color:${TONE.calls}">${nf0.format(r.calls)}</td><td>${fSec(r.total_s)}</td>` +
             `<td style="color:${heat(total ? 100 * r.total_s / total : 0, SCALES.pct_of_total_time) || "inherit"}">${fPct(total ? 100 * r.total_s / total : 0)}</td>` +
             `<td style="color:${TONE.avg_ms}">${nf0.format(r.avg_ms)}</td><td>${fSec(r.sql_s)}</td><td>${fSec(r.python_s)}</td>` +
@@ -1648,7 +1711,7 @@ for (const T of Object.values(TABLES)) {
         const w = e.target;
         if (T.shown >= T.rows.length || w.scrollTop + w.clientHeight < w.scrollHeight - 400) return;
         const next = Math.min(T.shown + TABLE_CHUNK, T.rows.length), cols = visCols();
-        $(T.tbl + " tbody").insertAdjacentHTML("beforeend", T.rows.slice(T.shown, next).map(r => rowHtml(r, T.by, cols, T.denom)).join(""));
+        $(T.tbl + " tbody").insertAdjacentHTML("beforeend", T.rows.slice(T.shown, next).map(r => T.by === "slowq" ? sqRowHtml(r) : rowHtml(r, T.by, cols, T.denom)).join(""));
         T.shown = next;
         setTableCount(T);
     });
@@ -1697,15 +1760,30 @@ function removeIssueTag(i) {
     if (state.data && !state.hidden.issues) renderIssues();
 }
 
+// a slow-query shape as a chart item: its runs over time
+const sqLabel = text => text.length > 40 ? text.slice(0, 39) + "…" : text;
+const isSqPicked = shape => state.sqTags.some(t => t.shape === shape);
+function toggleSqTag(shape) {
+    const before = pickedCount(), i = state.sqTags.findIndex(t => t.shape === shape);
+    if (i >= 0) state.sqTags.splice(i, 1);
+    else {
+        state.sqTags.push(Object.assign({shape, label: sqLabel(sqData().labels[shape] || shape)}, defaultSeries("slowq"), {hue: nextHue()}));
+    }
+    itemsChanged(before);
+    if (state.data && !state.hidden.table && state.tableGroup === "slowq") renderTable(true);
+}
+
 function removeItem(id) {
     if (id[0] === "t") return removeHistTag(+id.slice(1));
     if (id[0] === "i") return removeIssueTag(+id.slice(1));
+    if (id[0] === "q") return toggleSqTag(state.sqTags[+id.slice(1)].shape);
 }
 
 function removeAllItems() {
     const before = pickedCount();
     state.histTags = [];
     state.issueTags = [];
+    state.sqTags = [];
     markPicked();
     itemsChanged(before);
     if (state.data && !state.hidden.table) renderTable();
@@ -1713,7 +1791,7 @@ function removeAllItems() {
 }
 
 // ---- "Chart items & series": one row per item, one checkbox per series it can plot as bars or lines ---------
-const ITEM_KIND = {total: "everything selected", tag: "", issue: "error / warning"};
+const ITEM_KIND = {total: "everything selected", tag: "", issue: "error / warning", slowq: "slow query"};
 function itemKindLabel(it) {
     if (it.kind !== "tag") return ITEM_KIND[it.kind];
     return it.tag.by ? GROUP_LABEL[it.tag.by] : "text search";
@@ -1725,7 +1803,7 @@ function renderHistSeriesMenu() {
     const sideHead = `<th colspan="3" class="grp">average ms</th><th colspan="3" class="grp">total ms</th><th rowspan="2" class="grp">requests</th>`;
     const compHead = `<th>all</th><th>py</th><th>sql</th><th>all</th><th>py</th><th>sql</th>`;
     const cell = (it, side, key) => {
-        if (!seriesAllowed(it, key)) return `<td class="na" data-tip="An error or warning only has occurrences, no processing time.">–</td>`;
+        if (!seriesAllowed(it, key)) return `<td class="na" data-tip="${it.kind === "slowq" ? "A slow query's time is not split into SQL and Python." : "An error or warning only has occurrences, no processing time."}">–</td>`;
         const on = it.cfg[side].has(key), color = seriesColor(it.hue, key);
         return `<td class="cbcell${on ? " on" : ""}" style="--c:${color}"><label class="cb"><input type="checkbox" data-item="${it.id}" data-side="${side}" data-s="${key}"${on ? " checked" : ""}>` +
             `<i class="sw${side === "lines" ? " ln" : ""}" style="${side === "lines" ? `border-top-color:${color};border-top-style:${DASH[SERIES_BY[key].group] ? (key === "req" ? "dotted" : "dashed") : "solid"}` : `background:${color}`}"></i></label></td>`;
@@ -1747,9 +1825,15 @@ document.addEventListener("click", e => {
     if (getSelection().toString()) return;
     const tr = e.target.closest("#tbl tbody tr[data-name]");
     if (tr) return openDetail(state.tableGroup, tr.dataset.name);
+    const sq = e.target.closest("#tbl tbody tr[data-sq]");
+    if (sq) return openSlowq(sq.dataset.sq);
     const sel = e.target.closest("#selTbl tbody tr[data-sel-item]"), it = sel && itemById(sel.dataset.selItem);
     if (!it) return;
     if (it.kind === "issue") return openIssue(it.tag);
+    if (it.kind === "slowq") {                                          // its longest run
+        const r = sqData().rows.find(x => x.shape === it.tag.shape);
+        return r && openSlowq(r.id);
+    }
     if (it.tag.by) return openDetail(it.tag.by, it.tag.term);
     state.filter = it.tag.label;                                        // a search: show what it matches in the main table
     $("#filter").value = state.filter;
@@ -1762,6 +1846,180 @@ document.addEventListener("contextmenu", e => {                          // righ
     e.preventDefault();
     removeItem(sel.dataset.selItem);
 });
+
+/* ---- slow queries (PostgreSQL slow-query logs): one table row per query, a form with its SQL ---------------- */
+// one row per shape: the runs of one query whatever its values (its SQL with every literal replaced by ?)
+const SQ_COLS = [
+    {key: "last", label: "last logged", l: true, tip: "When PostgreSQL logged its last run (UTC), as that run ended."},
+    {key: "db", label: "database", l: true},
+    {key: "n", label: "runs", tip: "Runs of this query in the selection, whatever its values."},
+    {key: "total_s", label: "total s", tip: "How long its runs ran, added up."},
+    {key: "avg_s", label: "avg s"},
+    {key: "max_s", label: "max s", tip: "Its longest run: clicking the row opens it."},
+    {key: "head", label: "SQL (shape)", l: true, tip: "Its SQL with every literal replaced by ? and lists of values folded into one."},
+];
+const sqData = () => (state.data && state.data.slowq) || {rows: [], n: 0, labels: {}};
+const fEpoch = s => new Date(s * 1000).toISOString().replace("T", " ").slice(0, 23);
+
+const sqDbs = r => r.dbs.length === 1 ? r.dbs[0] || "–" : `${r.dbs.length} databases`;
+function sqRowHtml(r) {
+    return `<tr data-sq="${esc(r.id)}"${isSqPicked(r.shape) ? ` class="picked"` : ""}><td class="l dim">${fEpoch(r.last)}</td>` +
+        `<td class="l dim" title="${esc(r.dbs.map(d => d || "–").join(", "))}">${esc(sqDbs(r))}</td>` +
+        `<td style="color:${TONE.calls}">${nf0.format(r.n)}</td><td>${fSec(r.total_s)}</td><td style="color:${TONE.avg_ms}">${fSec(r.avg_s)}</td><td>${fSec(r.max_s)}</td>` +
+        `<td class="op sqhead" data-tip="${esc("<b>" + esc(r.head) + "</b><span class=\"scale\">Click for its longest run · right-click to select it (its runs become a histogram item).</span>")}">${esc(r.head)}</td></tr>`;
+}
+
+function renderSqTable(T, bodyOnly) {
+    const d = sqData(), {key, dir} = state.sqSort, q = state.filter.trim().toLowerCase();
+    const cache = d._sorted || (d._sorted = {});
+    let rows = cache[key + dir] || (cache[key + dir] = d.rows.slice().sort((a, b) => {
+        const x = key === "db" ? sqDbs(a) : a[key], y = key === "db" ? sqDbs(b) : b[key];
+        return (typeof x === "number" ? x - y : String(x || "").localeCompare(String(y || ""))) * dir;
+    }));
+    if (q) rows = rows.filter(r => (r._s || (r._s = (r.dbs.join(" ") + " " + r.head).toLowerCase())).includes(q));
+    Object.assign(T, {rows, shown: Math.min(TABLE_CHUNK, rows.length), by: "slowq", denom: undefined, total: d.shapes || 0});
+    setTableCount(T);
+    const body = rows.slice(0, T.shown).map(sqRowHtml).join("") ||
+        `<tr><td class="empty" colspan="${SQ_COLS.length}">${d.n ? "No matching slow queries" : "No slow queries in the selection"}</td></tr>`;
+    const tb = $(T.tbl + " tbody");
+    if (bodyOnly && tb) {
+        tb.innerHTML = body;
+        $(T.wrap).scrollTop = 0;
+        return;
+    }
+    const head = SQ_COLS.map(c => `<th class="${c.l ? "l" : ""}${c.key === key ? " sorted" + (dir > 0 ? " asc" : "") : ""}" data-sqsort="${c.key}"` +
+        `${c.tip ? ` data-tip="${esc(c.tip)}"` : ""}>${c.label}</th>`).join("");
+    $(T.tbl).innerHTML = `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>`;
+}
+
+// SQL laid out for reading (a logged query is often one long line) and highlighted. layout: false keeps it as logged
+const SQL_TOKEN = /(--[^\n]*|\/\*[\s\S]*?\*\/)|([Ee]?'(?:[^']|'')*'?)|("(?:[^"]|"")*"?)|(\$\d+|%\(\w+\)s|%s)|((?<![\w$.])\d+(?:\.\d+)?(?![\w.]))|([A-Za-z_][\w$]*)|(\s+)|([\s\S])/g;
+const SQL_KW = new Set(("select from where and or not in is null as on join left right inner outer full cross lateral natural group by " +
+    "order having limit offset fetch union intersect except all distinct insert into values update set delete returning with recursive " +
+    "case when then else end exists between like ilike similar asc desc nulls first last for share no key nowait skip locked conflict do " +
+    "nothing using over partition window filter true false any some cast interval array default").split(" "));
+const SQL_BREAK = new Set(["select", "from", "where", "group", "order", "having", "limit", "offset", "union", "intersect", "except",
+    "returning", "values", "set", "with", "join", "left", "right", "inner", "full", "cross", "natural", "on", "and", "or", "insert",
+    "update", "delete", "for", "window"]);
+const SQL_DEEPER = new Set(["and", "or", "on"]);                // continuation lines: indented under their clause
+const SQL_GLUE = new Set(["left", "right", "inner", "outer", "full", "cross", "natural", "for", "do", "on", "union", "intersect",
+    "except", "distinct", "is", "not"]);                         // no new line after these (LEFT JOIN, ON CONFLICT, FOR UPDATE...)
+const SQL_CLS = ["sql-cm", "sql-str", "sql-qid", "sql-param", "sql-num"];   // the first five groups of SQL_TOKEN
+
+function sqlHtml(sql, layout) {
+    let out = "", depth = 0, space = false, prev = "", between = false;
+    for (const m of sql.matchAll(SQL_TOKEN)) {
+        const tok = m[0], g = m.slice(1).findIndex(x => x !== undefined), word = g === 5 ? tok.toLowerCase() : "";
+        if (g === 6 && layout) { space = true; continue; }          // whitespace: one space, or the new line below
+        if (layout) {
+            const brk = out && SQL_BREAK.has(word) && !SQL_GLUE.has(prev) && !(word === "and" && between);   // x BETWEEN a AND b
+            if (brk) out += "\n" + "  ".repeat(depth * 2 + (SQL_DEEPER.has(word) ? 1 : 0));
+            else if (space) out += " ";
+            space = false;
+            if (tok === "(") depth++;
+            else if (tok === ")") depth = Math.max(0, depth - 1);
+        }
+        if (word === "between") between = true;
+        else if (word === "and") between = false;
+        if (g !== 6) prev = word;
+        out += g >= 0 && g < 5 ? `<span class="${SQL_CLS[g]}">${esc(tok)}</span>` : SQL_KW.has(word) ? `<span class="sql-kw">${esc(tok)}</span>` : esc(tok);
+    }
+    return out;
+}
+
+function renderSqlPane() {
+    const d = form && form.kind === "slowq" && form.d;
+    if (!d || !$("#sqlPane")) return;
+    const lay = form.layout !== false;
+    $("#sqlPane").innerHTML = `<div class="exhead"><span class="seg">` +
+        `<button class="btn ghost${lay ? " on" : ""}" data-sql-mode="1">Formatted</button><button class="btn ghost${lay ? "" : " on"}" data-sql-mode="0">As logged</button></span>` +
+        `<button class="btn ghost" data-copy="${esc(d.sql)}">Copy</button></div>` +
+        (d.cut ? `<div class="sub">The query was longer than 100,000 characters: the rest is cut.</div>` : "") +
+        `<pre class="full sql">${sqlHtml(d.sql, lay)}</pre>`;
+}
+
+function sameShapeSection(d) {
+    const s = d.same;
+    if (!s.n) return `<div class="sub">No run of this query is left in the selection.</div>`;
+    const f = (k, val) => `<div class="fact"><span class="k">${k}</span><span class="val">${val}</span></div>`;
+    const rows = s.items.map(x => `<tr class="link${x.id === d.id ? " picked" : ""}" data-sq-open="${esc(x.id)}"><td class="l">${fEpoch(x.t)}</td>` +
+        `<td class="l dim">${esc(x.db || "–")}</td><td style="color:${TONE.avg_ms}">${fSec(x.s)}</td></tr>`).join("");
+    return `<div class="pane-card"><div class="facts">` + f("Runs", `<span style="color:${TONE.calls}">${nf0.format(s.n)}</span>`) + f("Total time", fDur(s.total_s)) +
+        f("Average · max", `${fSec(s.total_s / s.n)} s · ${fSec(s.max_s)} s`) + f("First · last", `${fEpoch(s.first)} · ${fEpoch(s.last)}`) + `</div>` +
+        `<div class="msg-block"><span class="k">Shape <span class="sub">its SQL with every literal replaced by ?, lists folded</span></span>` +
+        `<pre class="full sql">${sqlHtml(d.shape_text, true)}</pre></div></div>` +
+        `<div class="pane-card">${durHist(s.durations, [["this one", 1000 * d.s, "#ef8a5a"]], "runs")}</div>` +
+        `<div class="pane-card"><div class="sub">${s.n > s.items.length ? `The ${nf0.format(s.items.length)} longest runs, in time order` : "Every run, in time order"}; click one to open it.</div>` +
+        `<div class="table-wrap occwrap"><table class="static occtbl"><thead><tr><th class="l">logged at</th><th class="l">database</th><th>duration s</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+
+function runningSection(r) {
+    if (!r.n) return `<div class="sub">No request or job of its database overlaps it in the loaded logs.</div>`;
+    const rows = r.items.map(o => `<tr class="link" data-run-op="${esc(o.operation)}"><td class="l">${fStamp(o.stamp)}</td>` +
+        `<td class="l op">${esc(o.operation)}</td><td class="l dim">${esc(o.family)}</td><td style="color:${TONE.avg_ms}">${fSec(o.seconds)}</td></tr>`).join("");
+    return `<div class="sub srcnote">The requests and jobs whose run overlaps the query's, to the second, in its database${r.n > r.items.length ? ` (the ${nf0.format(r.items.length)} longest of ${nf0.format(r.n)})` : ""}. ` +
+        `Matched by time only: the slow-query log names no worker. Click one to open its operation.</div>` +
+        `<div class="table-wrap occwrap"><table class="static occtbl"><thead><tr><th class="l">ended at</th><th class="l">operation</th><th class="l">type</th><th>seconds</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+// the slow queries that overlapped an operation / app / type's calls (its "Logged during" tab)
+function sqDuringSection(sd, grouped) {
+    const head = `<div class="pane-head"><b>Slow queries during it</b></div>`;
+    if (!sd.n) return head + `<div class="sub">No slow query of the slow-query logs overlaps ${grouped ? "its operations' calls" : "its calls"}.</div>`;
+    const rows = sd.items.map(x => `<tr class="link" data-sq-open="${esc(x.id)}"><td class="l">${fEpoch(x.last)}</td>` +
+        `<td class="l dim" title="${esc(x.dbs.map(d => d || "–").join(", "))}">${esc(sqDbs(x))}</td><td style="color:${TONE.calls}">${nf0.format(x.n)}</td>` +
+        `<td>${fSec(x.total_s)}</td><td>${fSec(x.max_s)}</td><td>${nf0.format(x.calls)}</td><td class="l op sqhead" title="${esc(x.head)}">${esc(x.head)}</td></tr>`).join("");
+    return head + `<div class="sub srcnote">${plural(sd.runs, "run")} of ${plural(sd.n, "distinct slow query", "distinct slow queries")} ran while ` +
+        `${grouped ? "its operations" : "it"} did: their spans overlap, to the second, in the same database` +
+        `${sd.n > sd.items.length ? ` (the ${nf0.format(sd.items.length)} with the most time shown)` : ""}. One row per query whatever its values. ` +
+        `Matched by time only: the slow-query log names no worker, so a query may belong to another request that ran meanwhile. Click one to open its longest run.</div>` +
+        `<div class="table-wrap occwrap"><table class="static occtbl"><thead><tr><th class="l">last logged</th><th class="l">database</th>` +
+        `<th data-tip="Its runs that overlap these calls.">runs</th><th>total s</th><th>max s</th>` +
+        `<th data-tip="How many of the calls its runs overlap, added up.">calls</th><th class="l">SQL (shape)</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function openSlowq(id) {
+    if (!state.data) return false;
+    pushForm();
+    const r = sqData().rows.find(x => x.id === id);                     // a shape's row, opened on its longest run
+    form = {kind: "slowq", id, shape: r && r.shape, layout: form && form.kind === "slowq" ? form.layout : true};
+    const seq = ++detailSeq;
+    raw.seq++;
+    const loading = `<div class="sub">Loading…</div>`;
+    const head = d => `<div class="mhead"><span class="badge b-slow-queries">slow query</span>` +
+        (d ? `<span><b>${fSec(d.s)} s</b></span><span class="sub">${esc(d.db || "no database")} · logged ${fEpoch(d.t)} UTC</span>` +
+             (state.data.hist_key ? selButton().replace("Selected items are plotted", "Selecting a slow query plots the runs of its shape") : "") : "") + `</div>`;
+    const tabs = [{id: "sql", label: "SQL", html: `<div class="pane-card" id="sqlPane">${loading}</div>`},
+                  {id: "same", label: r ? `Same shape (${nf0.format(r.n)})` : "Same shape", html: `<div id="sameSection">${loading}</div>`}];
+    const logs = !SNAP && state.files.some(f => f.kind === "log");
+    if (logs) tabs.push({id: "running", label: "Running at the same time", html: `<div class="pane-card" id="runSection">${loading}</div>`});
+    showForm("Slow query", head(null), tabs, "slowq");
+    const p = selectionParams();
+    p.set("id", id);
+    api("/api/slowq?" + p).then(d => {
+        if (seq !== detailSeq) return;
+        form.d = d;
+        form.shape = d.shape;
+        const f = (k, val) => `<div class="fact"><span class="k">${k}</span><span class="val">${val}</span></div>`;
+        $("#mSheet").innerHTML = head(d) + `<div class="facts">` + f("Started", `≈ ${fEpoch(d.t - d.s)}`) + f("Logged (ended)", fEpoch(d.t)) +
+            f("Duration", `<span style="color:${TONE.avg_ms}">${fSec(d.s)} s</span>`) + f("Database", esc(d.db || "–")) +
+            f("Same shape", `${nf0.format(d.same.n)} run${d.same.n === 1 ? "" : "s"} in the selection`) + `</div>`;
+        renderSqlPane();
+        $("#sameSection").innerHTML = sameShapeSection(d);
+        setTabLabel("same", `Same shape (${nf0.format(d.same.n)})`);
+    }).catch(e => {
+        if (seq !== detailSeq) return;
+        for (const id_ of ["#sqlPane", "#sameSection"]) $(id_).innerHTML = `<div class="sub err">Could not load the query: ${esc(e.message)}</div>`;
+    });
+    if (!logs) return true;
+    p.set("running", "1");
+    api("/api/slowq?" + p).then(rn => {
+        if (seq !== detailSeq) return;
+        $("#runSection").innerHTML = runningSection(rn);
+        setTabLabel("running", `Running at the same time (${nf0.format(rn.n)})`);
+    }).catch(e => { if (seq === detailSeq) $("#runSection").innerHTML = `<div class="sub err">${esc(e.message)}</div>`; });
+    return true;
+}
 
 /* ---- raw log lines of the open popup (a warning / error, or an operation / app / type) ------------ */
 // The server keeps only counts, so the lines themselves are re-found in the loaded files on demand: a list of
@@ -1864,7 +2122,7 @@ let formStack = [];              // forms opened before this one (Back returns t
 let restoringForm = false;       // re-opening a form (Back, or new data after a filter change): not a new visit
 let detailSeq = 0;
 
-const formOwner = () => !form ? null : form.kind === "issue" ? {by: "issue", name: form.key} : {by: form.by, name: form.name};
+const formOwner = () => !form || form.kind === "slowq" ? null : form.kind === "issue" ? {by: "issue", name: form.key} : {by: form.by, name: form.name};
 
 // sheet: the row's own numbers, always shown above the tabs (like an Odoo form's sheet)
 // one icon per kind of row, in the form's title
@@ -1874,6 +2132,7 @@ const FORM_ICON = {
     family: `<g fill="none" stroke="#6ec1c9" stroke-width="2" stroke-linejoin="round"><path d="M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9z"/><circle cx="8" cy="8" r="1.6"/></g>`,
     WARNING: `<g fill="none" stroke="#e6c15a" stroke-width="2" stroke-linejoin="round"><path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18v.5" stroke-linecap="round"/></g>`,
     ERROR: `<g fill="none" stroke="#ef5350" stroke-width="2"><circle cx="12" cy="12" r="9.5"/><path d="M8.5 8.5l7 7M15.5 8.5l-7 7" stroke-linecap="round"/></g>`,
+    slowq: `<g fill="none" stroke="#ef8a5a" stroke-width="2"><ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v13c0 1.7 3.6 3 8 3s8-1.3 8-3v-13M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></g>`,
 };
 const formIcon = kind => `<svg class="ficon" width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">${FORM_ICON[kind] || FORM_ICON.ERROR}</svg>`;
 
@@ -1908,7 +2167,7 @@ function pushForm() {
 // true when the form could open (its row, or a filter on it, is still there)
 function reopen(f) {
     restoringForm = true;
-    try { return f.kind === "issue" ? openIssue({level: f.key[0], logger: f.key[1], message: f.key[2]}) : openDetail(f.by, f.name); }
+    try { return f.kind === "issue" ? openIssue({level: f.key[0], logger: f.key[1], message: f.key[2]}) : f.kind === "slowq" ? openSlowq(f.id) : openDetail(f.by, f.name); }
     finally { restoringForm = false; }
 }
 
@@ -1931,6 +2190,7 @@ document.addEventListener("keydown", e => {
     if (state.anchor && $("#modal").hidden) { state.anchor = null; return paintPreview(null); }   // a half-picked range
     if (!$("#domModal").hidden) { $("#domModal").hidden = true; return; }
     if (!$("#ffModal").hidden) { $("#ffModal").hidden = true; return; }
+    if (!$("#reqHistModal").hidden) { $("#reqHistModal").hidden = true; return; }
     if (!$("#histSeriesMenu").hidden) { $("#histSeriesMenu").hidden = true; return; }
     if (!$("#modal").hidden) closeModal();
 });
@@ -1973,7 +2233,18 @@ async function factsChanged() {
     try { await analyzeNow(); } finally { busy("ff"); }              // (reopens the form with the new numbers)
 }
 
+// the whole report narrowed to client addresses: only their requests and the warnings logged during them
+function setIps(ips) {
+    state.ips = ips;
+    factsChanged();
+}
+
 function renderFfButton() {
+    const ip = $("#clearIp");
+    ip.hidden = !state.ips.length || !!(state.data && state.data.imported);
+    ip.innerHTML = `Client IP: ${esc(state.ips.join(", "))} <span class="tag-x">×</span>`;
+    ip.dataset.tip = "The whole report shows only the requests from this client and the warnings / errors logged during them " +
+        "(no cron jobs, no warnings logged outside a request). Click to show every client again.";
     const n = ffCount(), b = $("#clearFacts");
     b.hidden = !n || !!(state.data && state.data.imported);
     b.textContent = `${n} item filter${n === 1 ? "" : "s"}`;
@@ -2049,13 +2320,15 @@ function factTable(f, owner) {
     const picked = new Set((filt && filt.facts[f.detail]) || []);
     const can = !!owner && !state.data.imported && !SNAP && !(owner.by === "issue" && ISSUE_UNFILTERABLE.includes(f.detail));
     const logins = f.values.some(v => v[2]), sig = !!(f.sig && f.sig.base), avg = !!f.avg_ms;
+    const only = f.detail === "client IP" && !state.data.imported && !SNAP;
     const rows = f.values.slice(0, shown).map(([v, n, who], i) => {
         const ok = can && v !== FACT_OTHER;
         return `<tr${ok ? ` class="link${picked.has(v) ? " picked" : ""}" data-fact="${esc(f.detail)}" data-v="${esc(v)}"` : ""}>` +
             `<td class="l val">${esc(v)}</td>${logins ? `<td class="l dim">${who ? esc(who.join(", ")) : ""}</td>` : ""}` +
             `<td style="color:${TONE.calls}">${nf0.format(n)}</td><td>${fPct(f.total ? 100 * n / f.total : 0)}</td>` +
             (sig ? `<td class="sig">${sigText(n, f.sig)}</td>` : "") +
-            (avg ? `<td style="color:${TONE.avg_ms}">${f.avg_ms[i] == null ? "" : nf0.format(f.avg_ms[i])}</td>` : "") + `</tr>`;
+            (avg ? `<td style="color:${TONE.avg_ms}">${f.avg_ms[i] == null ? "" : nf0.format(f.avg_ms[i])}</td>` : "") +
+            (only ? `<td>${v === FACT_OTHER ? "" : `<button class="btn ghost" data-only-ip="${esc(v)}" data-tip="Narrow the whole report to this client: its requests and the warnings logged during them.">only this IP</button>`}</td>` : "") + `</tr>`;
     }).join("");
     const notes = (f.distinct > f.values.length ? `<div class="sub">…and ${nf0.format(f.distinct - f.values.length)} more values not kept</div>` : "") +
         (f.other_n ? `<div class="sub">${nf0.format(f.other_n)} more not told apart (too many distinct values)</div>` : "");
@@ -2066,7 +2339,7 @@ function factTable(f, owner) {
         `<div class="table-wrap factwrap"><table class="facttbl static"><thead><tr><th class="l">value</th>${logins ? `<th class="l">accounts logged in from it</th>` : ""}` +
         `<th>count</th><th data-tip="Count divided by all the values of this detail.">share</th>` +
         (sig ? `<th data-tip="${esc(sigTip(f.sig))}">of ${esc(f.sig.unit)}</th>` : "") +
-        (avg ? `<th data-tip="${esc(AVG_TIP)}">avg ms</th>` : "") + `</tr></thead><tbody>${rows}</tbody></table></div>` +
+        (avg ? `<th data-tip="${esc(AVG_TIP)}">avg ms</th>` : "") + (only ? `<th></th>` : "") + `</tr></thead><tbody>${rows}</tbody></table></div>` +
         loadMoreBtn("fact:" + f.detail, f.values.length, shown) + notes + `</div>`;
 }
 
@@ -2094,7 +2367,7 @@ function issueOpsTable(r) {
 }
 
 // "Select" in a form's sheet: the same as right-clicking its row (a histogram item, a row of the selected items table)
-const formSelected = () => !form ? false : form.kind === "issue"
+const formSelected = () => !form ? false : form.kind === "slowq" ? isSqPicked(form.shape) : form.kind === "issue"
     ? state.issueTags.some(t => sameIssue(t, {level: form.key[0], logger: form.key[1], message: form.key[2]}))
     : isPicked(form.by, form.name);
 const selButton = () => `<button class="btn ghost selbtn${formSelected() ? " on" : ""}" id="formSel"` +
@@ -2102,6 +2375,7 @@ const selButton = () => `<button class="btn ghost selbtn${formSelected() ? " on"
 
 function toggleFormSelect() {
     if (!form) return;
+    if (form.kind === "slowq") return form.shape && toggleSqTag(form.shape);
     if (form.kind === "issue") {
         const k = {level: form.key[0], logger: form.key[1], message: form.key[2]}, i = state.issueTags.findIndex(t => sameIssue(t, k));
         if (i >= 0) removeIssueTag(i); else addIssueTag(k);
@@ -2226,11 +2500,21 @@ function sourcesSection(d, grouped) {
 const detailSig = d => d && d.calls ? {base: d.calls, unit: "calls", span: spanSecs(d.first, d.last)} : null;
 
 // how long the calls took: one bar per duration bin (ms, even steps on a log scale; see DUR_EDGES in app.py), with
-// the row's average and p95 marked. r: the row (null when the filters left none of it)
+// the row's average, median and p95 marked. r: the row (null when the filters left none of it). Clicking a bar
+// toggles an item filter on that span of durations (DUR_FACT)
 const fMs = ms => ms >= 1000 ? `${+(ms / 1000).toFixed(2)} s` : ms >= 10 ? `${nf0.format(ms)} ms` : `${+ms.toFixed(2)} ms`;
-function durationsSection(d, r) {
-    const bins = (d.durations && d.durations.bins) || [];
-    if (!bins.length) return `<div class="sub">No timed calls.</div>`;
+const DUR_FACT = "duration ms";
+const durationsSection = (d, r) => {
+    const o = !state.data.imported && !SNAP && formOwner(), f = o && ffFind(o.by, o.name);
+    return durHist(d.durations, r ? [["avg", r.avg_ms, TONE.avg_ms], ["median", 1000 * r.p50_s, "#7fd18b"], ["p95", 1000 * r.p95_s, "#ef8a5a"]] : [],
+        "calls", o ? (f && f.facts[DUR_FACT]) || [] : null);
+};
+
+// dur: {bins, estimated} (see _durations in app.py); marks: [[label, ms, color]], dashed lines; unit: what is counted;
+// picked: the DUR_FACT values filtered to, the bars then click to toggle them (null: not clickable)
+function durHist(dur, marks, unit, picked = null) {
+    const bins = (dur && dur.bins) || [];
+    if (!bins.length) return `<div class="sub">No timed ${unit}.</div>`;
     const W = 900, H = 280, L = 52, R = 12, T = 18, B = 40, w = (W - L - R) / bins.length;
     const total = bins.reduce((n, b) => n + b[2], 0), top = Math.max(...bins.map(b => b[2]));
     const y = n => T + (H - T - B) * (1 - n / top), every = Math.ceil(56 / w);
@@ -2243,20 +2527,25 @@ function durationsSection(d, r) {
     let svg = [0, .5, 1].map(f => `<line x1="${L}" x2="${W - R}" y1="${y(top * f)}" y2="${y(top * f)}" class="grid"/>` +
         `<text x="${L - 6}" y="${y(top * f) + 4}" text-anchor="end" class="dim">${nf0.format(top * f)}</text>`).join("");
     svg += bins.map(([lo, hi, n], i) => {
-        const tip = `<b>${hi === null ? `≥ ${fMs(lo)}` : `${fMs(lo)} – ${fMs(hi)}`}</b><br>${nf0.format(n)} calls · ${fPct(total ? 100 * n / total : 0)}`;
-        return `<g data-tip="${esc(tip)}"><rect class="dcol" x="${L + i * w}" y="${T}" width="${w}" height="${H - T - B}"/>` +
-            (n ? `<rect x="${L + i * w + 1}" y="${y(n)}" width="${Math.max(1, w - 2)}" height="${H - B - y(n)}" fill="${TONE.calls}" rx="1.5"/>` : "") + `</g>` +
+        const v = `${lo}-${hi === null ? "" : hi}`, on = picked && picked.includes(v);
+        const tip = `<b>${hi === null ? `≥ ${fMs(lo)}` : `${fMs(lo)} – ${fMs(hi)}`}</b><br>${nf0.format(n)} ${unit} · ${fPct(total ? 100 * n / total : 0)}` +
+            (picked ? `<span class="scale">Click to ${on ? "stop filtering" : "filter"} to these ${unit}.</span>` : "");
+        return `<g data-tip="${esc(tip)}"${picked ? ` data-dur="${v}"` : ""}><rect class="dcol${on ? " on" : ""}" x="${L + i * w}" y="${T}" width="${w}" height="${H - T - B}"/>` +
+            (n ? `<rect x="${L + i * w + 1}" y="${y(n)}" width="${Math.max(1, w - 2)}" height="${H - B - y(n)}" fill="${TONE.calls}" rx="1.5"` +
+                (picked && picked.length && !on ? ` opacity=".35"` : "") + `/>` : "") + `</g>` +
             (i % every ? "" : `<text x="${L + i * w}" y="${H - B + 16}" text-anchor="middle" class="dim">${fMs(lo)}</text>`);
     }).join("");
-    if (r) svg += [["avg", r.avg_ms, TONE.avg_ms], ["p95", 1000 * r.p95_s, "#ef8a5a"]].map(([k, ms, c], i) => {
+    svg += marks.map(([k, ms, c], i) => {
         const at = x(ms), left = at > W - 140;           // near the right edge: the label goes on the line's left
         return `<line x1="${at}" x2="${at}" y1="${T - 4}" y2="${H - B}" stroke="${c}" stroke-width="1.5" stroke-dasharray="4 3"/>` +
             `<text x="${left ? at - 4 : at + 4}" y="${T + 6 + 16 * i}" text-anchor="${left ? "end" : "start"}" style="fill:${c}">${k} ${fMs(ms)}</text>`;
     }).join("");
-    svg += `<text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle" class="dim">time per call (log scale)</text>`;
-    return `<div class="sub srcnote">How many calls took how long, ${nf0.format(total)} in all: each bar is one span of durations, ` +
-        `the spans growing evenly on a log scale so fast and slow calls both show.` +
-        (d.durations.estimated ? ` Counts are estimated from a sample of the calls.` : "") + `</div>` +
+    svg += `<text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle" class="dim">time per ${unit.replace(/s$/, "")} (log scale)</text>`;
+    return `<div class="sub srcnote">How many ${unit} took how long, ${nf0.format(total)} in all: each bar is one span of durations, ` +
+        `the spans growing evenly on a log scale so fast and slow ${unit} both show.` +
+        (dur.estimated ? ` Counts are estimated from a sample of the ${unit}.` : "") +
+        (dur.unfiltered ? ` Filtered on its durations: the bars count every ${unit.replace(/s$/, "")} of the selection, before the item filters, ` +
+            `and the spans kept are highlighted.` : "") + `</div>` +
         `<svg class="durhist" viewBox="0 0 ${W} ${H}" role="img" aria-label="Call durations">${svg}</svg>`;
 }
 
@@ -2286,8 +2575,12 @@ function openDetail(by, name) {
         {id: "details", label: "Details behind the grouping", html: `<div id="factsSection">${loading}</div>`},
     ];
     tabs.push({id: "durations", label: "Histogram", html: `<div class="pane-card" id="durSection">${loading}</div>`});
+    const cron = by === "operation" && name.startsWith("cron: ") && !state.data.imported && !SNAP;
+    if (cron) tabs.push({id: "meanwhile", label: "Requests during runs", html: `<div class="pane-card" id="cronReqSection">${loading}</div>`});
     if (grouped) tabs.push({id: "ops", label: "Operations", html: `<div class="pane-card" id="opsSection">${loading}</div>`});
-    tabs.push({id: "sources", label: "Logged during", html: `<div class="pane-card" id="srcSection">${loading}</div><div id="loggedFacts">${loading}</div>`});
+    const sqDuring = sqData().n > 0 && !state.data.imported && !SNAP;
+    tabs.push({id: "sources", label: "Logged during", html: `<div class="pane-card" id="srcSection">${loading}</div>` +
+        (sqDuring ? `<div class="pane-card" id="sqDuring">${loading}</div>` : "") + `<div id="loggedFacts">${loading}</div>`});
     if (!state.data.imported && !SNAP) tabs.push({id: "raw", label: "Raw log lines", html: rawSection()});
     showForm(DETAIL_TITLE[by], sheet, tabs, by);
     const owner = {by, name}, what = grouped ? GROUP_LABEL[by] : "operation name";
@@ -2304,6 +2597,9 @@ function openDetail(by, name) {
     const p = selectionParams();
     p.set("by", by);
     p.set("name", name);
+    if (cron) loadCronRequests(seq, p);
+    if (sqDuring) api("/api/op_slowq?" + p).then(sd => { if (seq === detailSeq) $("#sqDuring").innerHTML = sqDuringSection(sd, grouped); })
+        .catch(e => { if (seq === detailSeq) $("#sqDuring").innerHTML = `<div class="sub err">Could not match the slow queries: ${esc(e.message)}</div>`; });
     api("/api/detail?" + p).then(d => {
         if (seq !== detailSeq) return;
         const sig = detailSig(d);
@@ -2334,6 +2630,28 @@ function openDetail(by, name) {
     return true;
 }
 
+// a cron operation's form: the requests that ran while it ran (any overlap, to the second), their average and
+// how long they took, beside the average of every request of the selection
+function loadCronRequests(seq, p) {
+    api("/api/cron_requests?" + p).then(c => {
+        if (seq !== detailSeq) return;
+        const s = view().stats, all = s.requests ? 1000 * s.request_s / s.requests : null;
+        const avg = c.avg_ms === null ? "none" : fMs(c.avg_ms);
+        const facts = $("#mSheet .facts");
+        if (facts) facts.insertAdjacentHTML("beforeend", `<div class="fact" data-tip="${esc(
+            "The average time of the requests that ran while this cron job ran (their spans overlap one of its runs)" +
+            (all === null ? "." : `, against ${fMs(all)} for every request of the selection.`))}">` +
+            `<span class="k">Avg request during runs</span><span class="val">${esc(avg)}</span></div>`);
+        setTabLabel("meanwhile", `Requests during runs (${nf0.format(c.requests)})`);
+        $("#cronReqSection").innerHTML = `<div class="sub srcnote">${plural(c.requests, "request")} ran while one of its ` +
+            `${plural(c.runs, "run")} ran (a request counts when its span, its end less its duration, overlaps a run's, ` +
+            `to the second): ${avg} on average` + (all === null ? "" : `, against ${fMs(all)} for every request of the selection`) + `.</div>` +
+            durHist(c.durations, [["avg", c.avg_ms, TONE.avg_ms], ["all requests", all, "#9aa4b2"]].filter(m => m[1] !== null), "requests");
+    }).catch(e => {
+        if (seq === detailSeq) $("#cronReqSection").innerHTML = `<div class="sub err">Could not find its requests: ${esc(e.message)}</div>`;
+    });
+}
+
 function copyText(text) {
     if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
     const ta = document.createElement("textarea");                      // fallback for plain http on a non-local address
@@ -2354,6 +2672,16 @@ document.addEventListener("contextmenu", e => {                          // righ
     const short = esc(name.length > 60 ? name.slice(0, 59) + "…" : name);
     if (i >= 0) { removeHistTag(i); showTip(`Removed <b>${short}</b> from the histogram items`, e.clientX, e.clientY); }
     else { addHistTag({by, term: name, label: name}); showTip(`Added <b>${short}</b> to the histogram items`, e.clientX, e.clientY); }
+    setTimeout(hideTip, 1400);
+});
+
+document.addEventListener("contextmenu", e => {                          // right-click a slow query: pin the runs of its shape
+    const tr = e.target.closest("#tbl tbody tr[data-sq]"), r = tr && sqData().rows.find(x => x.id === tr.dataset.sq);
+    if (!r || !state.data.hist_key) return;
+    e.preventDefault();
+    const was = isSqPicked(r.shape);
+    toggleSqTag(r.shape);
+    showTip(`${was ? "Removed" : "Added"} the runs of this query (${nf0.format(r.n)}) ${was ? "from" : "to"} the histogram`, e.clientX, e.clientY);
     setTimeout(hideTip, 1400);
 });
 
@@ -2438,15 +2766,20 @@ document.addEventListener("click", e => {
         return itemsChanged(pickedCount());
     }
     if ((el = t.closest("[data-tab]"))) return setTab(el.dataset.tab);
+    if ((el = t.closest("[data-only-ip]"))) return setIps([el.dataset.onlyIp]);
+    if (t.closest("#clearIp")) return setIps([]);
     if ((el = t.closest("tr[data-fact]"))) {
         const o = formOwner();
         if (o && !getSelection().toString()) toggleFact(o.by, o.name, el.dataset.fact, el.dataset.v);
         return;
     }
+    if ((el = t.closest("[data-dur]"))) { const o = formOwner(); return o && toggleFact(o.by, o.name, DUR_FACT, el.dataset.dur); }
     if ((el = t.closest("[data-ff-rm]"))) { const o = formOwner(); return o && toggleFact(o.by, o.name, el.dataset.ffRm, el.dataset.v); }
     if (t.closest("#ffClearForm")) { const o = formOwner(); return o && clearFacts(o.by, o.name); }
     if (t.closest("#clearFacts")) return openFfModal();
     if (t.closest("#ffClose") || t.id === "ffModal") { $("#ffModal").hidden = true; return; }
+    if (t.closest("#reqHistClose") || t.id === "reqHistModal") { $("#reqHistModal").hidden = true; return; }
+    if (t.closest("#reqHistOpen")) return openReqHist();
     if (t.closest("#ffClearAll")) { $("#ffModal").hidden = true; return clearFacts(null); }
     if ((el = t.closest("[data-ff-del]"))) { const f = state.factFilters[+el.dataset.ffi]; return f && toggleFact(f.by, f.name, el.dataset.ffDel, el.dataset.v); }
     if ((el = t.closest("[data-ff-row]"))) {                    // one item's whole detail
@@ -2469,6 +2802,23 @@ document.addEventListener("click", e => {
     if (t.closest("#domReset")) { $("#domText").value = domApplied; return checkDomain(); }
     if ((el = t.closest("#domCopy"))) return copyText($("#domText").value).then(() => { el.textContent = "Copied"; setTimeout(() => el.textContent = "Copy", 1200); });
     if (t.closest("#serClose")) { $("#histSeriesMenu").hidden = true; return; }
+    if ((el = t.closest("[data-sqsort]"))) {
+        const k = el.dataset.sqsort;
+        state.sqSort = state.sqSort.key === k ? {key: k, dir: -state.sqSort.dir} : {key: k, dir: k === "db" || k === "head" ? 1 : -1};
+        return renderTable();
+    }
+    if (t.closest("#sqOpen")) {
+        $("#tableGroup").value = state.tableGroup = "slowq";
+        state.filter = $("#filter").value = "";
+        renderTable();
+        return $("#tablePanel").scrollIntoView({behavior: "smooth", block: "start"});
+    }
+    if ((el = t.closest("[data-sq-open]"))) return openSlowq(el.dataset.sqOpen);
+    if ((el = t.closest("[data-run-op]"))) return openDetail("operation", el.dataset.runOp);
+    if ((el = t.closest("[data-sql-mode]"))) {
+        form.layout = el.dataset.sqlMode === "1";
+        return renderSqlPane();
+    }
     if ((el = t.closest("[data-sort]"))) {
         const k = el.dataset.sort;
         state.sort = state.sort.key === k ? {key: k, dir: -state.sort.dir} : {key: k, dir: k === "operation" || k === "bottleneck" ? 1 : -1};
@@ -2537,6 +2887,7 @@ document.addEventListener("click", e => {
     if (t.closest("#resetBtn")) return resetAll();
     if (t.closest("#exportBtn")) return exportAs("/api/export?" + selectionParams(), "logtool-export.json");
     if (t.closest("#exportHtmlBtn")) return exportHtml();
+    if (t.closest("#exportTxtBtn")) return exportAs("/api/export_text?" + selectionParams(), "logtool-export.txt");
 });
 
 document.addEventListener("input", e => {
