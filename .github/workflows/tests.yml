@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -49,14 +49,66 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.10"
       - name: Build sdist and wheel
         run: |
-          python -m pip install build
+          python -m pip install build shiv==1.0.8
           python -m build
       - name: Wheel holds the web assets
         run: python -c "import sys, zipfile, glob; n = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); sys.exit(0 if all(f in n for f in ('logtool/static/app.js', 'logtool/static/style.css', 'logtool/templates/index.html')) else 1)"
+      - name: Build single-file executables
+        run: |
+          for cmd in logtool logtool-report; do
+            shiv dist/*.whl -c "$cmd" -o "dist/$cmd.pyz" -p '/usr/bin/env python3' --reproducible --compressed
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
+
+  pyz:
+    needs: package
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Single-file executables run
+        run: |
+          python dist/logtool.pyz --version
+          python dist/logtool-report.pyz tests/data/sample-19.0.log --top 5 > /dev/null
+
+  release:
+    needs: [test, frontend, pyz]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python3 -c 'import logtool; print(logtool.__version__)')
+          if gh release view "v$version" > /dev/null 2>&1; then
+            echo "::notice::v$version is already released; bump logtool.__version__ to publish a new one."
+            exit 0
+          fi
+          awk -v h="## [$version]" 'index($0, h) == 1 { on = 1; next } /^## / { on = 0 } on' CHANGELOG.md > notes.md
+          grep -q . notes.md || { echo "::error::CHANGELOG.md has no '## [$version]' section."; exit 1; }
+          gh release create "v$version" dist/*.pyz dist/*.whl dist/*.tar.gz \
+            --target "$GITHUB_SHA" --title "v$version" --notes-file notes.md

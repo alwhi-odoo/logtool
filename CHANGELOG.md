@@ -5,8 +5,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-18
+
 ### Added
 
+- **Single-file release**: every GitHub release carries `logtool.pyz` and `logtool-report.pyz`, built with
+  [shiv](https://github.com/linkedin/shiv). Download one, make it executable and run it: no clone, no virtualenv.
+  Pushing a new version to `main` publishes the release, with this changelog's section as its notes.
 - **Slow-query logs**: PostgreSQL's `pg_slow_queries.log` loads like any log, alone or beside the Odoo logs, with
   its own parser. Its queries follow the file, database and time selection and the filter editor (kind
   `slow_query`, fields `duration` and `sql`). The table lists them *By slow query*, one row per shape (the runs of
@@ -49,6 +54,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
   from the wrong IP.
 - With an item filter or an IP filter, the WebSocket / long-poll connections counted as *held open* are only those
   the filter keeps.
+
+### Removed
+
+- **Python 3.9**: logtool now needs Python 3.10 or newer. 3.9 reached its end of life in October 2025, and
+  GitHub's current Ubuntu runners no longer provide it.
 
 ## [1.2.0] - 2026-10-11
 
@@ -104,5 +114,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 First packaged release: the `logtool` web UI and the `logtool-report` command, with `install.sh`.
 
+[Unreleased]: https://github.com/alwhi-odoo/logtool/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/alwhi-odoo/logtool/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/alwhi-odoo/logtool/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/alwhi-odoo/logtool/releases/tag/v1.1.0

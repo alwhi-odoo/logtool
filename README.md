@@ -4,7 +4,7 @@ The project was fully implemented by Claude Code. All documentation beyond this 
 # logtool
 
 [![tests](https://github.com/alwhi-odoo/logtool/actions/workflows/tests.yml/badge.svg)](https://github.com/alwhi-odoo/logtool/actions/workflows/tests.yml)
-![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
 Where does an Odoo server's time go? Load one or more Odoo server logs and see SQL, Python and total time per
@@ -30,7 +30,19 @@ Everything runs on your machine: the logs never leave it.
 
 ## Install
 
-Python 3.9 or newer, on Linux.
+Python 3.10 or newer, on Linux.
+
+The quickest way is the single-file build attached to every
+[release](https://github.com/alwhi-odoo/logtool/releases/latest). It needs nothing but `python3`:
+
+```bash
+curl -LO https://github.com/alwhi-odoo/logtool/releases/latest/download/logtool.pyz
+chmod +x logtool.pyz
+./logtool.pyz                          # same options as `logtool`; logtool-report.pyz is the report command
+```
+
+On its first run it unpacks itself into `~/.shiv` (set `SHIV_ROOT` to put it elsewhere); later runs start straight
+away. To have the commands on your `PATH` and upgrade them in place, install it instead:
 
 ```bash
 git clone https://github.com/alwhi-odoo/logtool.git
@@ -42,7 +54,7 @@ cd logtool
 `logtool-report` commands into `~/.local/bin`, so they run from any directory. If that directory is not on your
 `PATH` yet, it is added to `~/.bashrc` / `~/.zshrc`: open a new terminal afterwards. Run it again to upgrade.
 `./install.sh --uninstall` removes everything it added. It also installs a release archive or wheel:
-`./install.sh logtool-1.2.0.tar.gz`.
+`./install.sh logtool-1.2.1-py3-none-any.whl`, both attached to each release.
 
 Or with pip, in a virtualenv of your own (the commands then work while it is activated):
 
