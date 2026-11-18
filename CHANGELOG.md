@@ -5,6 +5,45 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-18
+
+### Added
+
+- **Killed cron runs**: a cron run whose worker Odoo killed at its time limit (`WorkerCron (1234) timeout
+  after 900s`, logged by the main process without a database) never logs its end, so it was missing from the cron's
+  runs. It now counts, from its `starting` line to the kill, in the cron's own database, with status
+  `killed (timeout)`: an item filter on that status lists them. A run whose start and kill are in different log files
+  (a daily rotation in between) or in different chunks of a big file counts too, with the file of its kill, as does
+  one that started before a selected time interval and was killed in it.
+
+### Changed
+
+- **Code layout**: the two big modules are split into small ones, one concern each. The parser is now the
+  `logtool/parser/` package (16 modules, standard library only) and the web app the `logtool/web/` package
+  (24 modules). `logtool/profiler.py` and `logtool/app.py` remain as front doors, so `logtool`, `logtool-report`,
+  `python -m logtool.profiler` and `from logtool import profiler` work as before; what logtool does and how fast it
+  does it are unchanged. [ARCHITECTURE.md](ARCHITECTURE.md) maps every module and lists the rules, which
+  `tests/test_layout.py` checks. The tests are split by subject too (`tests/test_*.py`); without pytest they now run
+  with `python tests/run.py` (was `python tests/test_logtool.py`).
+- **Frontend layout**: `logtool/static/app.js` is split the same way into 14 plain scripts, one concern each
+  (`core.js`, `api.js`, `histogram.js`, `tables.js`, `details.js` ...), loaded in the order
+  `logtool/templates/index.html` lists them. Still no build step and no modules; Export HTML inlines every script in
+  that order. The page works as before.
+- The parse cache key covers every module of the parser. Logs cached by an earlier version are parsed once more.
+
+### Fixed
+
+- The *logged user id* and *logged records* details of an operation, app or type listed equally frequent values in
+  a different order on every run, and past 200 distinct values kept different ones: the values were counted in an
+  order that changes from one worker process to the next. The same log now gives the same details, and the same
+  exports, every time.
+- *Slowest first*: lines that are equally slow in several files were listed in the order of the files' internal
+  (random) ids. They are now in the order the files were loaded.
+- *Slowest first* on a cron job, automation rule or module loading with more than 400 runs read the files twice:
+  the quick look that skips fast lines only reads access lines, found none and started over.
+- A slow-query log or an exported summary unloaded while it was still being read stayed in memory, and a slow
+  query of it could still be opened.
+
 ## [1.2.1] - 2026-11-18
 
 ### Added
@@ -114,7 +153,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 First packaged release: the `logtool` web UI and the `logtool-report` command, with `install.sh`.
 
-[Unreleased]: https://github.com/alwhi-odoo/logtool/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/alwhi-odoo/logtool/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/alwhi-odoo/logtool/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/alwhi-odoo/logtool/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/alwhi-odoo/logtool/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/alwhi-odoo/logtool/releases/tag/v1.1.0

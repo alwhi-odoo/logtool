@@ -123,7 +123,7 @@ A term on a field that the occurrence's kind does not have is **not applicable**
 | `logged records` | request, job | text  | records named in the lines logged while it ran, written `model(id)` (several possible). See section 3.3 |
 | `duration ms` | request, job   | text   | a span of `duration` in milliseconds, written `"lo-hi"` (`lo` included, `hi` not) or `"lo-"` (no upper bound): `"100-150"`, `"5000-"`. Takes `=`, `!=`, `in`, `not in`; with several spans, any of them. The *Histogram* tab's bars are such spans |
 | `cron id`     | job            | text   | the cron job's id (`"8"`)                                                             |
-| `status`      | job            | text   | how a cron run ended (`fully done`, `processed`, …)                                   |
+| `status`      | job            | text   | how a cron run ended (`fully done`, `failed`, `killed (timeout)`, …)                    |
 | `remaining`   | job            | text   | how many records a cron run left for later (`"0"`)                                    |
 | `rule id`     | job            | text   | an automation rule's id (`"12"`)                                                      |
 | `records processed` | job      | text   | the records an automation rule run processed, written `done/total` (`"3/3"`)          |

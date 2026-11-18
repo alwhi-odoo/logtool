@@ -234,8 +234,14 @@
 
 <div id="busy" role="status" aria-live="polite" hidden><span class="spin"></span><span id="busyText">Working…</span></div>
 <div id="tip" role="tooltip"></div>
+{# The page's scripts, in load order: classic scripts sharing one global scope (no modules, no build step). While it
+   loads, a script can only use what an earlier one defines. ARCHITECTURE.md says what each one holds. An Export HTML
+   page (snapshot) carries the same scripts in the same order, inline: js maps each file name to its text. #}
+{% set scripts = ["core", "api", "selection", "stats", "filter_editor", "histogram", "tables", "chart_items", "slowq",
+                  "rawlines", "form", "facts", "details", "events"] %}
 {% if snapshot %}<script type="application/json" id="snapshot">{{ snapshot|tojson }}</script>
-<script>{{ js|safe }}</script>
-{% else %}<script src="{{ url_for('static', filename='app.js') }}"></script>{% endif %}
+{% for name in scripts %}<script>{{ js[name + ".js"]|safe }}</script>
+{% endfor %}{% else %}{% for name in scripts %}<script src="{{ url_for('static', filename=name + '.js') }}"></script>
+{% endfor %}{% endif %}
 </body>
 </html>

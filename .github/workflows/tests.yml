@@ -41,7 +41,7 @@ jobs:
         with:
           node-version: "22"
       - name: JavaScript syntax
-        run: node --check logtool/static/app.js
+        run: for f in logtool/static/*.js; do echo "$f"; node --check "$f" || exit 1; done
 
   package:
     runs-on: ubuntu-latest
@@ -55,7 +55,8 @@ jobs:
           python -m pip install build shiv==1.0.8
           python -m build
       - name: Wheel holds the web assets
-        run: python -c "import sys, zipfile, glob; n = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); sys.exit(0 if all(f in n for f in ('logtool/static/app.js', 'logtool/static/style.css', 'logtool/templates/index.html')) else 1)"
+        # every script and stylesheet of logtool/static/ and the page template
+        run: python -c "import sys, zipfile, glob; n = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); want = glob.glob('logtool/static/*.js') + ['logtool/static/style.css', 'logtool/templates/index.html']; missing = [f for f in want if f not in n]; print(len(want), 'files wanted, missing:', missing); sys.exit(1 if missing or len(want) < 3 else 0)"
       - name: Build single-file executables
         run: |
           for cmd in logtool logtool-report; do

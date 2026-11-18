@@ -62,10 +62,10 @@ access, and any analysis that needs data the log does not contain (e.g. per-quer
 
 ### 1.4 References
 
-* [README.md](../README.md): user guide.
-* [FILTERS.md](../FILTERS.md): the filter-domain language. It is part of this specification by reference (FR-FLT).
-* [CONTRIBUTING.md](../CONTRIBUTING.md): code organization and development rules.
-* [SECURITY.md](../SECURITY.md): security policy.
+* [README.md](README.md): user guide.
+* [FILTERS.md](FILTERS.md): the filter-domain language. It is part of this specification by reference (FR-FLT).
+* [ARCHITECTURE.md](ARCHITECTURE.md): code organization and development rules.
+* [README.md, Security](README.md#security): what the server accepts and refuses.
 * Odoo's logging format: `%(asctime)s %(pid)s %(levelname)s %(dbname)s %(name)s: %(message)s`.
 
 ### 1.5 Overview
@@ -89,11 +89,11 @@ files, which the user copies from a server or downloads from a hosting dashboard
         ▼
  ┌───────────────────── user's machine ──────────────────────┐
  │  browser ──HTTP (loopback)──▶ logtool server (Flask)       │
- │  app.js                        app.py: files, caches,      │
+ │  static/*.js                   logtool/web/: files, caches,│
  │                                 selections, export          │
  │                                     │                        │
  │                                     ▼                        │
- │                                profiler.py: parsing,         │
+ │                                logtool/parser/: parsing,     │
  │                                classification, merging,      │
  │                                worker-process pool           │
  │                                     ▲                        │
@@ -133,7 +133,8 @@ Users are technical but should not need to read the code or the log format to us
 
 ### 2.5 Design and implementation constraints
 
-* **C-1** The parser (`logtool/profiler.py`) shall use the Python standard library only.
+* **C-1** The parser (the `logtool/parser/` package, reached through `logtool/profiler.py`) shall use the Python
+  standard library only, and shall not depend on the web application.
 * **C-2** The web server's only runtime dependency shall be Flask.
 * **C-3** The frontend shall be plain JavaScript, HTML and CSS served by the application, with no build step and
   no external resources (scripts, fonts, styles, images).
@@ -233,7 +234,11 @@ versions. Requirements on it:
   without it shall be counted as untimed. Held-open connections (websocket upgrades) shall not count as work.
 * **FR-PARSE-4** Jobs shall be timed from their own messages: cron runs (Odoo 17 to 20 message shapes, including
   start / done pairs), automation rules (including time-based rules paired from "Starting" to "done"), and module
-  loading. Their time has no SQL / Python split.
+  loading. Their time has no SQL / Python split. A cron run whose worker the main process kills
+  (`WorkerCron (<pid>) timeout after <n>s`) shall count from that worker's last "starting" line to the kill, in the
+  cron's database, with status `killed (timeout)`. This shall hold when the two lines are in different chunks or
+  log files, and when the run started before a selected time interval and was killed in it; the run goes with the
+  file of its kill. Pairing across pieces shall not re-read any log.
 * **FR-PARSE-5** Each operation shall keep: calls, errors (5xx), SQL / Python / unsplit seconds, queries, the
   maximum, a percentile sample (at most 20,000 values, merged in proportion to the calls each part saw), HTTP
   status counts, per-minute activity and example lines (first, slowest, first failing).
@@ -420,6 +425,11 @@ Reference machine: 12 cores, SSD. Reference inputs: one 200 MB log of 34 days (a
 * **NFR-MAINT-3** Continuous integration shall run the self-test, the test suite, a frontend syntax check and a
   package build on every push and pull request.
 * **NFR-MAINT-4** The package version shall be defined in one place (`logtool/__init__.py`).
+* **NFR-MAINT-5** The code shall be split into modules of one concern each, of at most 1,000 lines, without import
+  cycles: the parser in `logtool/parser/`, the web application in `logtool/web/`, which uses the parser only
+  through `logtool/profiler.py`. `ARCHITECTURE.md` shall map every module.
+* **NFR-MAINT-6** The same log and selection shall give the same answer on every run: no result shall depend on
+  the order of a set or on a random identifier.
 
 ### 3.4 Data requirements
 
@@ -435,7 +445,7 @@ Reference machine: 12 cores, SSD. Reference inputs: one 200 MB log of 34 days (a
 | requirements | how they are verified |
 |---|---|
 | FR-PARSE, FR-CLI | `python -m logtool.profiler --selftest`: classification of every access-line shape, jobs, issues, formats, impossible timestamps. |
-| FR-LOAD, NFR-REL | `tests/test_logtool.py`: empty, binary, corrupt and truncated gzip, bz2, CRLF / latin-1, very long lines, many operations, unload during decompression, parse cache reuse and keys, workers stopped on SIGTERM. |
+| FR-LOAD, NFR-REL | `tests/test_loading.py`, `tests/test_cli.py`: empty, binary, corrupt and truncated gzip, bz2, CRLF / latin-1, very long lines, many operations, unload during decompression, parse cache reuse and keys, workers stopped on SIGTERM. |
 | FR-LOAD-5, FR-SEL-3 | Tests comparing chunked and interval results with a straight parse (`test_interval_from_chunks_matches_a_straight_parse`, `test_chunks_are_cut_at_log_entries`, ...). |
 | FR-DB | `test_only_db_reads_one_database_and_the_lines_without_one`, `test_rows_are_sent_again_after_the_database_to_read_changes`, `test_reset_reads_every_database_again`; the scan in a browser. |
 | FR-FLT | Fact-filter, domain round-trip, custom-condition and FILTERS.md example tests; `test_job_details_and_bare_numbers_make_valid_domains`. |
@@ -445,6 +455,8 @@ Reference machine: 12 cores, SSD. Reference inputs: one 200 MB log of 34 days (a
 | NFR-SEC-5 | `test_parse_cache_refuses_a_directory_others_can_write`. |
 | NFR-PERF | Measured manually on the reference inputs before a release (README, *Performance*). |
 | NFR-PORT, NFR-MAINT-3 | CI matrix on Python 3.10 to 3.13 and the package job. |
+| C-1, NFR-MAINT-5 | `tests/test_layout.py`: the parser imports the standard library only, every parser name the web application uses is exported, a module imports only from the ones listed above it, no module is over the size limit. |
+| NFR-MAINT-6 | `test_logged_details_are_counted_in_a_fixed_order`, `test_equally_slow_lines_list_in_the_order_the_files_were_loaded`. |
 | FR-UI, NFR-USE | Manual check in a browser before a release. |
 
 ---

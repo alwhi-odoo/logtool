@@ -43,7 +43,7 @@ logtool = "logtool.app:main"
 logtool-report = "logtool.profiler:main"
 
 [tool.setuptools]
-packages = ["logtool"]
+packages = ["logtool", "logtool.parser", "logtool.web"]
 
 [tool.setuptools.dynamic]
 version = { attr = "logtool.__version__" }

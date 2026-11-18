@@ -16,6 +16,9 @@ Everything runs on your machine: the logs never leave it.
 * **Operations, apps and types.** Every request is grouped into an operation (`call_kw sale.order.action_confirm`,
   `/shop/<slug>`, `cron: Mail: Email Queue Manager`), the Odoo app that owns it, and the kind of work (`ui.read`,
   `api.write`, `report`, `assets`, ...). Cron jobs, automation rules and module loading join the same tables.
+  A cron run whose worker was killed at its time limit (`WorkerCron (1234) timeout after 900s`) logs no end line;
+  it still counts, from its `starting` line to the kill, with status `killed (timeout)`, also when the two lines are
+  in different log files (a daily rotation in between).
 * **Time split.** Odoo's access lines end with `<queries> <sql seconds> <other seconds>`, so every request's time
   splits into SQL and Python for free.
 * **Histogram.** Requests and time over the whole log or any interval, down to 1-minute buckets.
@@ -54,7 +57,7 @@ cd logtool
 `logtool-report` commands into `~/.local/bin`, so they run from any directory. If that directory is not on your
 `PATH` yet, it is added to `~/.bashrc` / `~/.zshrc`: open a new terminal afterwards. Run it again to upgrade.
 `./install.sh --uninstall` removes everything it added. It also installs a release archive or wheel:
-`./install.sh logtool-1.2.1-py3-none-any.whl`, both attached to each release.
+`./install.sh logtool-1.3.0-py3-none-any.whl`, both attached to each release.
 
 Or with pip, in a virtualenv of your own (the commands then work while it is activated):
 
@@ -344,6 +347,8 @@ warning.
 
 * [FILTERS.md](FILTERS.md): the filter-domain language, for people and for agents writing domains.
 * [SRS.md](SRS.md): the software requirements specification (what logtool must do, and why).
+* [ARCHITECTURE.md](ARCHITECTURE.md): where the code is, module by module, and the rules it follows. Start here
+  to change logtool. [AGENTS.md](AGENTS.md) is the short version for AI coding agents.
 * [CHANGELOG.md](CHANGELOG.md): what changed in each version.
 
 ## Tests
@@ -352,8 +357,12 @@ warning.
 pip install -e ".[test]"
 python -m logtool.profiler --selftest   # the parser's built-in checks
 python -m pytest                        # the web app: broken files, odd input, API edge cases, intervals
-python tests/test_logtool.py            # the same cases without pytest
+python tests/run.py                     # the same cases without pytest
+python tests/run.py cron domain         # only the cases whose name contains one of these words
 ```
+
+The cases are in `tests/test_*.py`, one module per subject (loading, API, details, cron, filters, domain, chunks,
+exports, slow queries, command lines). `tests/test_layout.py` checks the layout of the code itself.
 
 ## License
 
