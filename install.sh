@@ -44,8 +44,8 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 TARGET="${1:-$SRC}"
-if ! "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null; then
-    echo "logtool needs Python 3.9 or newer ($PY is $("$PY" -V 2>&1 || echo missing)). Set PYTHON=/path/to/python3." >&2
+if ! "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+    echo "logtool needs Python 3.10 or newer ($PY is $("$PY" -V 2>&1 || echo missing)). Set PYTHON=/path/to/python3." >&2
     exit 1
 fi
 

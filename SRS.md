@@ -126,7 +126,7 @@ Users are technical but should not need to read the code or the log format to us
 
 ### 2.4 Operating environment
 
-* Linux with Python 3.9 or newer and Flask 2.3 or newer.
+* Linux with Python 3.10 or newer and Flask 2.3 or newer.
 * A current desktop browser (Chromium, Firefox, Safari) on the same machine. The in-browser database scan of
   `.gz` files needs `DecompressionStream`.
 * Typical inputs: one log of 10 MB to 1 GB, or tens of daily logs adding up to several GB.
@@ -406,7 +406,7 @@ Reference machine: 12 cores, SSD. Reference inputs: one 200 MB log of 34 days (a
 
 #### 3.3.5 Portability and installation (NFR-PORT)
 
-* **NFR-PORT-1** The software shall run on Linux with CPython 3.9 to 3.13.
+* **NFR-PORT-1** The software shall run on Linux with CPython 3.10 to 3.13.
 * **NFR-PORT-2** `install.sh` shall install into a private virtualenv, link both commands into `~/.local/bin`,
   add that directory to `PATH` if needed, upgrade in place when run again, and uninstall cleanly.
 * **NFR-PORT-3** The wheel shall contain the templates and static files.
@@ -444,7 +444,7 @@ Reference machine: 12 cores, SSD. Reference inputs: one 200 MB log of 34 days (a
 | FR-API, NFR-SEC-2 | Bad input gives 400 tests; cross-origin and foreign-host tests, IPv6 loopback. |
 | NFR-SEC-5 | `test_parse_cache_refuses_a_directory_others_can_write`. |
 | NFR-PERF | Measured manually on the reference inputs before a release (README, *Performance*). |
-| NFR-PORT, NFR-MAINT-3 | CI matrix on Python 3.9 to 3.13 and the package job. |
+| NFR-PORT, NFR-MAINT-3 | CI matrix on Python 3.10 to 3.13 and the package job. |
 | FR-UI, NFR-USE | Manual check in a browser before a release. |
 
 ---
